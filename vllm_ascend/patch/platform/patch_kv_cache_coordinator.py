@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM projectx
+import logging
+import os
 import sys
 from collections.abc import Mapping
 from math import lcm
@@ -7,6 +9,9 @@ from math import lcm
 import vllm
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
+
+logger = logging.getLogger(__name__)
+_DEBUG_BLOCK_RACE = os.getenv("VLLM_DEBUG_BLOCK_RACE", "0") == "1"
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -227,7 +232,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # miss its same-spec siblings.
         for idx in self.eagle_attn_group_indices:
             for gid in self.attention_groups[idx][1]:
+                old_use_eagle = self.single_type_managers[gid].use_eagle
                 self.single_type_managers[gid].use_eagle = True
+                if _DEBUG_BLOCK_RACE and not old_use_eagle:
+                    logger.warning(
+                        "BLOCK_RACE: use_eagle flag propagation to manager gid=%d, "
+                        "spec type=%s, group_ids=%s, was_eagle=%s, this_may_cause_prefix_cache_miss "
+                        "if write_and_read_paths_have_inconsistent_flags!",
+                        gid, type(self.attention_groups[idx][0]).__name__,
+                        self.attention_groups[idx][1], old_use_eagle
+                    )
 
         # The LCM of the block sizes of all attention types.
         # The cache hit length must be a multiple of the LCM of the block sizes

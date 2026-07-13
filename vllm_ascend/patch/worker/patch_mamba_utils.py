@@ -1,10 +1,12 @@
 # mypy: ignore-errors
 
 import itertools
+import os
 from typing import Any
 
 import torch
 from vllm.config import CacheConfig
+from vllm.logger import logger
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -211,6 +213,9 @@ def _patched_create(cls, max_num_reqs, kv_cache_config, copy_funcs, make_buffer)
 MambaCopyBuffers.create = _patched_create
 
 
+_DEBUG_MAMBA_STATE = os.getenv("VLLM_DEBUG_MAMBA_STATE", "0") == "1"
+
+
 def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
@@ -264,6 +269,16 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
+        if _DEBUG_MAMBA_STATE:
+            num_accepted = input_batch.num_accepted_tokens_cpu[i]
+            logger.debug(
+                "MAMBA_STATE: req_id=%s, prev_state_idx=%s, curr_state_idx=%d, "
+                "num_computed=%d, num_scheduled=%d, num_blocks=%d, "
+                "num_accepted=%d, num_speculative_blocks=%d, block_size=%d",
+                req_id, prev_state_idx, curr_state_idx, req_state.num_computed_tokens,
+                num_scheduled_tokens, num_blocks, num_accepted, 
+                num_speculative_blocks, block_size
+            )
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             mamba_utils.collect_mamba_copy_meta(
                 copy_bufs,

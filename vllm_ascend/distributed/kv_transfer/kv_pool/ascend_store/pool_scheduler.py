@@ -1,9 +1,12 @@
 import math
+import os
 from typing import Any, cast
 
 import vllm.envs as envs
 import zmq
 from vllm.config import VllmConfig
+
+_DEBUG_MAMBA_TOUCH = os.getenv("VLLM_DEBUG_MAMBA_TOUCH", "0") == "1"
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -566,6 +569,13 @@ class KVPoolScheduler:
         for group_id in self.mamba_group_ids:
             group_block_ids = req_meta.block_ids_by_group[group_id]
             current_step_sending.extend([block_id for block_id in group_block_ids if block_id > 0])
+        if _DEBUG_MAMBA_TOUCH:
+            logger.warning(
+                "MAMBA_TOUCH: req_id=%s, event_id=%s, block_ids=%s, "
+                "mamba_group_ids=%s, can_save=%s",
+                req_meta.req_id, using_event_id, current_step_sending,
+                self.mamba_group_ids, req_meta.can_save
+            )
         logger.debug("event: %s touch blocks: %s", using_event_id, current_step_sending)
         assert self._block_pool is not None
         self._block_pool.touch([self._block_pool.blocks[block_id] for block_id in current_step_sending])

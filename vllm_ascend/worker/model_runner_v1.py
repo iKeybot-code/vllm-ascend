@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -204,6 +205,8 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+_DEBUG_SEQ_LENS_CPU_STALE = os.getenv("VLLM_DEBUG_SEQ_LENS_CPU_STALE", "0") == "1"
 
 
 @dataclass
@@ -1343,6 +1346,22 @@ class NPUModelRunner(GPUModelRunner):
             and prev_req_id_to_index
         )
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
+            if _DEBUG_SEQ_LENS_CPU_STALE:
+                stale_threshold = 10
+                for i in range(num_reqs):
+                    req_id = input_batch.req_ids[i]
+                    opt_seq_len = self.optimistic_seq_lens_cpu[i]
+                    actual_computed = input_batch.num_computed_tokens_cpu[i]
+                    drift = opt_seq_len - actual_computed
+                    if drift > stale_threshold or drift < -stale_threshold:
+                        logger.warning(
+                            "SEQ_LENS_STALE: req_id=%s, opt_seq_len=%d, "
+                            "actual_computed=%d, drift=%d, num_scheduled=%d, "
+                            "num_accepted=%d",
+                            req_id, opt_seq_len, actual_computed, drift,
+                            input_batch.num_scheduled_tokens_cpu[i],
+                            input_batch.num_accepted_tokens_cpu[i]
+                        )
             self._correct_optimistic_seq_lens_cpu(num_reqs)
 
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was

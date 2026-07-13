@@ -3,6 +3,7 @@
 """Scheduler-side manager for recompute CPU offloading."""
 
 import contextlib
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -11,6 +12,8 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
+
+_DEBUG_BLOCK_RACE = os.getenv("VLLM_DEBUG_BLOCK_RACE", "0") == "1"
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
@@ -270,6 +273,14 @@ class RecomputeCPUOffloadScheduler:
                     # for this scheduling step. If the request is then
                     # preempted before forward, that block does not contain the
                     # hashed KV and must not remain in the GPU prefix cache.
+                    if _DEBUG_BLOCK_RACE:
+                        logger.warning(
+                            "BLOCK_RACE: preempting req_id=%s, block_id=%d, "
+                            "block_hash=%s, computed_tokens=%d, block_idx=%d, "
+                            "group_block_size=%d, hash_set_but_block_not_computed!",
+                            req_id, block_id, gpu_block.block_hash, 
+                            num_computed_tokens, block_idx, group_block_size
+                        )
                     self._gpu_block_pool._maybe_evict_cached_block(gpu_block)
 
             for block_idx, block_id in enumerate(aligned_group_gpu_ids):
