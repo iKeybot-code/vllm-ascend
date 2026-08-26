@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM Ascend · Prefix Cache 全链路架构</title>
+<style>
+  :root {
+    --font-sans: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --weight-regular: 400;
+    --weight-medium: 600;
+    --weight-strong: 700;
+
+    --text-caption: 12px/18px var(--font-sans);
+    --text-code: 13px/20px var(--font-mono);
+    --text-body: 14px/22px var(--font-sans);
+    --text-title: 16px/24px var(--font-sans);
+    --text-section: 20px/28px var(--font-sans);
+
+    --surface: #ffffff;
+    --surface-muted: #f5f6f8;
+    --surface-soft: #eceef1;
+    --border: #d8dce3;
+    --border-soft: #e6e8ec;
+
+    --brand: #5b2dd9;
+    --brand-soft: #efe9ff;
+    --brand-border: #c9b8ff;
+    --accent: #14a07b;
+    --accent-soft: #e2f6ee;
+    --accent-border: #a8e0c9;
+    --neutral-ink: #2b2f3a;
+    --text-muted: #6b7280;
+
+    --chart-series-1: #5b2dd9;
+    --chart-series-2: #14a07b;
+    --chart-series-3: #d97706;
+    --chart-series-4: #2563eb;
+    --chart-other: #94a3b8;
+
+    --radius: 8px;
+    --radius-card: 12px;
+    --radius-full: 999px;
+
+    --spacer-4: 4px;
+    --spacer-8: 8px;
+    --spacer-12: 12px;
+    --spacer-16: 16px;
+    --spacer-20: 20px;
+    --spacer-24: 24px;
+
+    --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #1c1d22;
+      --surface-muted: #24262b;
+      --surface-soft: #2c2e35;
+      --border: #3a3d46;
+      --border-soft: #323439;
+
+      --brand-soft: #2a1d4a;
+      --brand-border: #4a3a7a;
+      --accent-soft: #133b2e;
+      --accent-border: #2a6e57;
+      --neutral-ink: #e6e7ea;
+      --text-muted: #9aa0ac;
+
+      --shadow-card: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font: var(--text-body);
+    color: var(--neutral-ink);
+    background: var(--surface-muted);
+    padding: var(--spacer-24);
+  }
+
+  .host {
+    max-width: 1200px;
+    margin: 0 auto;
+    background: var(--surface);
+    padding: var(--spacer-24);
+    border-radius: var(--radius-card);
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacer-24);
+    box-shadow: var(--shadow-card);
+  }
+
+  .host h1 {
+    font: var(--weight-strong) 24px/32px var(--font-sans);
+    margin: 0;
+    color: var(--brand);
+    letter-spacing: -0.01em;
+  }
+
+  .section { display: flex; flex-direction: column; gap: var(--spacer-16); }
+  .section h2 {
+    font: var(--weight-strong) var(--text-section);
+    margin: 0;
+    color: var(--brand);
+    letter-spacing: -0.01em;
+  }
+
+  .section h3 {
+    font: var(--weight-medium) var(--text-title);
+    margin: 0;
+  }
+
+  .tags { display: flex; flex-wrap: wrap; gap: var(--spacer-8); }
+  .tag {
+    font: var(--text-caption);
+    padding: 2px 10px;
+    border-radius: var(--radius-full);
+    background: var(--brand-soft);
+    color: var(--brand);
+    border: 1px solid var(--brand-border);
+    white-space: nowrap;
+  }
+  .tag.accent { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+  .tag.neutral { background: var(--surface-soft); color: var(--text-muted); border-color: var(--border-soft); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--spacer-16); }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--spacer-16); }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: var(--spacer-16);
+    box-shadow: var(--shadow-card);
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacer-8);
+  }
+  .card h3 {
+    font: var(--weight-medium) var(--text-title);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--spacer-8);
+    flex-wrap: wrap;
+  }
+  .card h3 .num {
+    font: var(--weight-strong) 12px/1 var(--font-mono);
+    width: 22px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--brand-soft); color: var(--brand);
+    border-radius: var(--radius-full);
+    border: 1px solid var(--brand-border);
+  }
+  .card .role {
+    font: var(--text-caption);
+    padding: 2px 8px; border-radius: var(--radius-full);
+    white-space: nowrap;
+  }
+  .role.upstream { background: var(--surface-soft); color: var(--text-muted); border: 1px solid var(--border-soft); }
+  .role.patch { background: var(--brand-soft); color: var(--brand); border: 1px solid var(--brand-border); }
+  .role.custom { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); }
+
+  .card ul { margin: 4px 0 0; padding-left: 18px; font: var(--text-body); }
+  .card li { margin: var(--spacer-4) 0; }
+  .card .desc { font: var(--text-body); color: var(--text-muted); }
+
+  .svg-wrap {
+    background: var(--surface-muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: var(--spacer-16);
+    overflow-x: auto;
+  }
+  .svg-wrap svg { display: block; width: 100%; height: auto; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: var(--spacer-12);
+    font: var(--text-caption);
+    color: var(--text-muted);
+    padding: var(--spacer-4) var(--spacer-8);
+  }
+  .legend .dot {
+    display: inline-block; width: 10px; height: 10px;
+    border-radius: var(--radius-full); margin-right: 6px;
+    vertical-align: middle;
+  }
+  .dot.brand { background: var(--brand); }
+  .dot.accent { background: var(--accent); }
+  .dot.neutral { background: var(--text-muted); }
+
+  table {
+    width: 100%; border-collapse: collapse;
+    font: var(--text-body);
+  }
+  th, td {
+    text-align: left; padding: 10px 12px;
+    border-bottom: 1px solid var(--border-soft);
+    vertical-align: top;
+  }
+  th {
+    font: var(--weight-medium) var(--text-caption);
+    color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    background: var(--surface-muted);
+  }
+  tr:last-child td { border-bottom: none; }
+  td .pill {
+    font: var(--text-caption);
+    padding: 1px 8px; border-radius: var(--radius-full);
+    display: inline-block;
+    white-space: nowrap;
+  }
+  .pill.up { background: var(--surface-soft); color: var(--text-muted); }
+  .pill.pa { background: var(--brand-soft); color: var(--brand); }
+  .pill.cu { background: var(--accent-soft); color: var(--accent); }
+
+  .summary {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--spacer-12);
+  }
+  .metric {
+    background: var(--surface-muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: var(--spacer-12) var(--spacer-16);
+    text-align: center;
+  }
+  .metric .val { font: var(--weight-strong) 28px/1 var(--font-mono); }
+  .metric .lbl { font: var(--text-caption); color: var(--text-muted); margin-top: 6px; }
+  .metric.brand .val { color: var(--brand); }
+  .metric.accent .val { color: var(--accent); }
+  .metric.muted .val { color: var(--text-muted); }
+  .metric.warn .val { color: var(--chart-series-3); }
+
+  .conclusion {
+    border-left: 4px solid var(--brand);
+  }
+  .conclusion ul { margin: 8px 0 0; padding-left: 18px; }
+  .conclusion li { margin: var(--spacer-4) 0; }
+
+  @media (max-width: 900px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    .summary { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="host">
+
+  <!-- ===== 0. 总览 ===== -->
+  <div class="section">
+    <h1>vLLM Ascend · Prefix Cache 全链路架构</h1>
+    <div class="tags">
+      <span class="tag">代码版本 2d75463</span>
+      <span class="tag accent">插件架构 (entry_points 注入)</span>
+      <span class="tag neutral">4 种适配模式：复用 / Patch / 继承 / 自定义</span>
+    </div>
+    <p style="color: var(--text-muted); margin: 8px 0 0;">
+      生成日期：2026-08-19 &nbsp;|&nbsp; 项目仓库：vLLM Ascend（硬件插件，通过 entry_points 注入 vLLM 主项目）
+    </p>
+    <div class="summary">
+      <div class="metric brand"><div class="val">~40%</div><div class="lbl">上游直接复用</div></div>
+      <div class="metric"><div class="val">~20%</div><div class="lbl">Patch 覆盖</div></div>
+      <div class="metric muted"><div class="val">~15%</div><div class="lbl">继承扩展</div></div>
+      <div class="metric accent"><div class="val">~25%</div><div class="lbl">完全自定义</div></div>
+    </div>
+  </div>
+
+  <!-- ===== 1. 全链路主流程图 ===== -->
+  <div class="section">
+    <h2>① 全链路主流程</h2>
+    <div class="svg-wrap">
+      <svg viewBox="0 0 820 1380" width="100%" preserveAspectRatio="xMidYMin meet">
+        <defs>
+          <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#6b7280"/>
+          </marker>
+          <marker id="arrBrand" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#5b2dd9"/>
+          </marker>
+        </defs>
+
+        <!-- API Server -->
+        <text x="20" y="30" font-family="var(--font-sans)" font-size="12" fill="#6b7280">API Server 进程 (asyncio)</text>
+        <rect x="20" y="44" width="780" height="72" rx="10" fill="#f5f6f8" stroke="#d8dce3"/>
+        <rect x="40" y="58" width="200" height="44" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+        <text x="140" y="78" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">HTTP /v1/chat/completions</text>
+        <text x="140" y="94" text-anchor="middle" font-size="11" fill="#6b7280">OpenAIServingChat (上游)</text>
+        <path d="M240 80 H300" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+        <rect x="310" y="58" width="240" height="44" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+        <text x="430" y="78" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">AsyncLLM.add_request()</text>
+        <text x="430" y="94" text-anchor="middle" font-size="11" fill="#6b7280">Request + block_hashes 生成 (上游)</text>
+        <path d="M550 80 H620" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+        <rect x="630" y="58" width="150" height="44" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="705" y="78" text-anchor="middle" font-size="13" font-weight="600" fill="#5b2dd9">IPC Queue</text>
+        <text x="705" y="94" text-anchor="middle" font-size="11" fill="#6b7280">跨进程通信</text>
+
+        <!-- 进程间箭头 -->
+        <path d="M705 102 V160" stroke="#5b2dd9" stroke-width="1.5" fill="none" marker-end="url(#arrBrand)"/>
+        <text x="720" y="135" font-size="11" fill="#5b2dd9">EngineCore 进程</text>
+
+        <!-- EngineCore 边框 -->
+        <text x="20" y="160" font-size="12" fill="#6b7280">EngineCore 进程 (独占 NPU)</text>
+        <rect x="20" y="174" width="780" height="1160" rx="10" fill="#fafbff" stroke="#c9b8ff" stroke-dasharray="4 4"/>
+
+        <!-- Scheduler 阶段标签 -->
+        <text x="40" y="200" font-size="12" font-weight="600" fill="#5b2dd9">② Scheduler.schedule()</text>
+
+        <!-- Running 队列 -->
+        <rect x="40" y="214" width="740" height="120" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+        <text x="56" y="234" font-size="12" font-weight="600" fill="#2b2f3a">Part A · running 队列 (Decode / 继续 Prefill)</text>
+        <rect x="56" y="244" width="340" height="70" rx="6" fill="#f5f6f8" stroke="#e6e8ec"/>
+        <text x="66" y="262" font-size="11" fill="#2b2f3a">num_new_tokens = num_tokens_with_spec</text>
+        <text x="66" y="278" font-size="11" fill="#2b2f3a">  - num_computed_tokens</text>
+        <text x="66" y="294" font-size="11" fill="#6b7280">受 long_prefill_token_threshold 截断</text>
+        <rect x="420" y="244" width="340" height="70" rx="6" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="430" y="262" font-size="11" font-weight="600" fill="#5b2dd9">allocate_slots()</text>
+        <text x="430" y="278" font-size="11" fill="#2b2f3a">分配失败 → 抢占 (Preemption)</text>
+        <text x="430" y="294" font-size="11" fill="#6b7280">PD 分离: recompute_offload / 普通场景: FCFS</text>
+        <path d="M396 279 H420" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+        <!-- Waiting 队列 (Prefix Cache 核心) -->
+        <rect x="40" y="350" width="740" height="430" rx="8" fill="#ffffff" stroke="#c9b8ff" stroke-width="1.5"/>
+        <text x="56" y="370" font-size="12" font-weight="600" fill="#5b2dd9">③ Part B · waiting 队列 (Prefix Cache 核心)</text>
+
+        <!-- Step 1 -->
+        <rect x="56" y="384" width="710" height="100" rx="6" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="66" y="402" font-size="11" font-weight="600" fill="#5b2dd9">Step 1 · Prefix Cache 查找</text>
+        <text x="66" y="418" font-size="11" fill="#2b2f3a">常规: kv_cache_manager.get_computed_blocks(request)</text>
+        <text x="66" y="434" font-size="11" fill="#2b2f3a">PD 增强: _get_computed_blocks_for_connector()</text>
+        <text x="66" y="450" font-size="11" fill="#2b2f3a">  → coordinator.find_longest_cache_hit(block_hashes)</text>
+        <text x="66" y="466" font-size="11" fill="#6b7280">  → block_pool.get_cached_block(hash) 链式查找</text>
+
+        <!-- Step 2 -->
+        <rect x="56" y="494" width="710" height="56" rx="6" fill="#f5f6f8" stroke="#e6e8ec"/>
+        <text x="66" y="512" font-size="11" font-weight="600" fill="#2b2f3a">Step 2 · 外部 KV (KVConnector) 查找</text>
+        <text x="66" y="528" font-size="11" fill="#6b7280">connector.get_num_new_matched_tokens() → 远端命中数 + load_kv_async</text>
+        <text x="66" y="544" font-size="11" fill="#6b7280">partial-group hit + ext_tokens=0 → 回退到统一 get_computed_blocks</text>
+
+        <!-- Step 3 -->
+        <rect x="56" y="558" width="710" height="72" rx="6" fill="#f5f6f8" stroke="#e6e8ec"/>
+        <text x="66" y="576" font-size="11" font-weight="600" fill="#2b2f3a">Step 3 · 计算实际需计算 token 数</text>
+        <text x="66" y="592" font-size="11" fill="#2b2f3a">num_new_tokens = total - local_hit - external_hit</text>
+        <text x="66" y="608" font-size="11" fill="#6b7280">异步加载 → num_new_tokens=0 / 投机 pad → 1+spec / chunked 截断</text>
+        <text x="66" y="624" font-size="11" fill="#6b7280">例: 总 1000 - 本地 600 - 远端 100 = 实际 prefill 300</text>
+
+        <!-- Step 4-6 -->
+        <rect x="56" y="638" width="225" height="130" rx="6" fill="#ffffff" stroke="#d8dce3"/>
+        <text x="66" y="656" font-size="11" font-weight="600" fill="#2b2f3a">Step 4 · allocate_slots</text>
+        <text x="66" y="672" font-size="11" fill="#2b2f3a">分配新物理块</text>
+        <text x="66" y="686" font-size="11" fill="#2b2f3a">touch 命中块防 evict</text>
+        <text x="66" y="700" font-size="11" fill="#6b7280">block 不够 → break</text>
+
+        <rect x="295" y="638" width="225" height="130" rx="6" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="305" y="656" font-size="11" font-weight="600" fill="#5b2dd9">Step 5 · 异步 KV 加载</text>
+        <text x="305" y="672" font-size="11" fill="#2b2f3a">status=</text>
+        <text x="305" y="686" font-size="11" fill="#2b2f3a"> WAITING_FOR_REMOTE_KVS</text>
+        <text x="305" y="700" font-size="11" fill="#6b7280">不加入 running</text>
+        <text x="305" y="714" font-size="11" fill="#6b7280">等传输完成回调</text>
+
+        <rect x="535" y="638" width="225" height="130" rx="6" fill="#e2f6ee" stroke="#a8e0c9"/>
+        <text x="545" y="656" font-size="11" font-weight="600" fill="#14a07b">Step 6 · 加入 running</text>
+        <text x="545" y="672" font-size="11" fill="#2b2f3a">更新 num_computed_tokens</text>
+        <text x="545" y="686" font-size="11" fill="#2b2f3a">status = RUNNING</text>
+        <text x="545" y="700" font-size="11" fill="#6b7280">下轮从此点继续计算</text>
+        <text x="545" y="714" font-size="11" fill="#6b7280">剩余 prefill → inflight</text>
+
+        <path d="M281 703 H295" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+        <path d="M520 703 H535" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+        <!-- 分隔线 -->
+        <line x1="40" y1="800" x2="780" y2="800" stroke="#d8dce3" stroke-dasharray="2 4"/>
+
+        <!-- KV Cache 查找内部细节 -->
+        <text x="40" y="820" font-size="12" font-weight="600" fill="#5b2dd9">④ Prefix Cache 查找内部: AscendHybridKVCacheCoordinator</text>
+        <rect x="40" y="834" width="740" height="200" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+
+        <rect x="56" y="848" width="225" height="170" rx="6" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="66" y="866" font-size="11" font-weight="600" fill="#5b2dd9">find_longest_cache_hit</text>
+        <text x="66" y="882" font-size="11" fill="#2b2f3a">不动点迭代算法</text>
+        <text x="66" y="898" font-size="11" fill="#6b7280">1. 各 group 独立查 hit</text>
+        <text x="66" y="912" font-size="11" fill="#6b7280">2. 取最小值缩短候选</text>
+        <text x="66" y="926" font-size="11" fill="#6b7280">3. 重新迭代直到收敛</text>
+        <text x="66" y="940" font-size="11" fill="#6b7280">4. FullAttention 截断</text>
+        <text x="66" y="956" font-size="11" fill="#6b7280">单调下降+下界0→收敛</text>
+
+        <rect x="295" y="848" width="225" height="170" rx="6" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="305" y="866" font-size="11" font-weight="600" fill="#5b2dd9">CompressAttentionManager</text>
+        <text x="305" y="882" font-size="11" fill="#2b2f3a">压缩 MLA 专属</text>
+        <text x="305" y="898" font-size="11" fill="#6b7280">逻辑块 = block_size</text>
+        <text x="305" y="912" font-size="11" fill="#6b7280">  × compress_ratio</text>
+        <text x="305" y="926" font-size="11" fill="#6b7280">BlockHashListWithBlockSize</text>
+        <text x="305" y="940" font-size="11" fill="#6b7280">按逻辑块聚合 hash 查找</text>
+        <text x="305" y="956" font-size="11" fill="#6b7280">避免物理块级误命中</text>
+
+        <rect x="535" y="848" width="225" height="170" rx="6" fill="#f5f6f8" stroke="#e6e8ec"/>
+        <text x="545" y="866" font-size="11" font-weight="600" fill="#2b2f3a">cache_blocks (写入)</text>
+        <text x="545" y="882" font-size="11" fill="#2b2f3a">block_pool.cache_full_blocks</text>
+        <text x="545" y="898" font-size="11" fill="#6b7280">注册 hash→block 到</text>
+        <text x="545" y="912" font-size="11" fill="#6b7280">全局索引</text>
+        <text x="545" y="926" font-size="11" fill="#14a07b">★ 后续请求即可命中!</text>
+        <text x="545" y="940" font-size="11" fill="#6b7280">仅写完整逻辑块</text>
+        <text x="545" y="956" font-size="11" fill="#6b7280">num_full_blocks = tokens</text>
+        <text x="545" y="970" font-size="11" fill="#6b7280">  // (bs×compress_ratio)</text>
+
+        <!-- 分隔线 -->
+        <line x1="40" y1="1054" x2="780" y2="1054" stroke="#d8dce3" stroke-dasharray="2 4"/>
+
+        <!-- 执行阶段 -->
+        <text x="40" y="1074" font-size="12" font-weight="600" fill="#5b2dd9">⑤ Worker / ModelRunner.execute_model()</text>
+        <rect x="40" y="1088" width="355" height="110" rx="6" fill="#ffffff" stroke="#d8dce3"/>
+        <text x="50" y="1106" font-size="11" font-weight="600" fill="#2b2f3a">prepare_inputs()</text>
+        <text x="50" y="1122" font-size="11" fill="#6b7280">→ AscendBlockTables.compute_slot_mappings</text>
+        <text x="50" y="1136" font-size="11" fill="#6b7280">  Triton kernel: position → block_idx</text>
+        <text x="50" y="1150" font-size="11" fill="#6b7280">  → block_number → slot_id</text>
+        <text x="50" y="1164" font-size="11" fill="#6b7280">  NPU: 整块加载 + tl.gather 优化</text>
+
+        <rect x="405" y="1088" width="355" height="110" rx="6" fill="#ffffff" stroke="#d8dce3"/>
+        <text x="415" y="1106" font-size="11" font-weight="600" fill="#2b2f3a">model.forward() + Sampler</text>
+        <text x="415" y="1122" font-size="11" fill="#6b7280">Prefill: dense attention + 写 KV</text>
+        <text x="415" y="1136" font-size="11" fill="#6b7280">Decode: 读 KV cache + 写 1 token</text>
+        <text x="415" y="1150" font-size="11" fill="#6b7280">reshape_and_cache: slot_mapping 写入</text>
+        <text x="415" y="1164" font-size="11" fill="#6b7280">AscendSampler: greedy + penalties</text>
+
+        <path d="M395 1143 H405" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+        <!-- 输出阶段 -->
+        <rect x="40" y="1212" width="740" height="100" rx="8" fill="#e2f6ee" stroke="#a8e0c9"/>
+        <text x="56" y="1232" font-size="12" font-weight="600" fill="#14a07b">⑥ update_from_output → 写入 Prefix Cache → 返回</text>
+        <text x="56" y="1250" font-size="11" fill="#2b2f3a">request.num_computed_tokens += scheduled_tokens</text>
+        <text x="56" y="1266" font-size="11" fill="#14a07b">★ kv_cache_manager.cache_blocks() → block_pool 注册全局 hash 索引 → 后续请求可命中</text>
+        <text x="56" y="1282" font-size="11" fill="#2b2f3a">EOS / max_tokens? → finish_requests() → free blocks → EngineCoreOutput</text>
+        <text x="56" y="1298" font-size="11" fill="#6b7280">Streaming → 每 token 推 SSE delta / Non-streaming → 攒齐返回 JSON</text>
+
+      </svg>
+    </div>
+    <div class="legend">
+      <span><span class="dot brand"></span>Ascend 自维护</span>
+      <span><span class="dot neutral"></span>上游复用</span>
+      <span><span class="dot accent"></span>关键写入点</span>
+    </div>
+  </div>
+
+  <!-- ===== 2. 八阶段卡片 ===== -->
+  <div class="section">
+    <h2>② 八阶段逐层解析</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3><span class="num">1</span> API Server 入口 <span class="role upstream">上游复用</span></h3>
+        <ul>
+          <li>FastAPI/Quart HTTP Server (上游)</li>
+          <li>OpenAIServingChat.create_chat_completion (上游)</li>
+          <li>Tokenizer 编码 → prompt_token_ids (上游)</li>
+          <li>AsyncLLM.add_request() (上游)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">2</span> Block Hash 链 <span class="role upstream">上游复用</span></h3>
+        <ul>
+          <li>Request.block_hasher 按 hash_block_size 切片 (上游)</li>
+          <li>链式 SHA256: hash1 = sha256(hash0 + t128..t255) (上游)</li>
+          <li>一旦某 hash 不匹配后续必不匹配 → break (上游)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">3</span> Scheduler 调度 <span class="role patch">继承扩展</span></h3>
+        <ul>
+          <li>RecomputeScheduler(Scheduler) (自维护)</li>
+          <li>Part A: running 队列 allocate_slots + 抢占 (上游)</li>
+          <li>Part B: waiting 队列 prefix cache 查找 (自维护)</li>
+          <li>_get_computed_blocks_for_connector PD 增强 (自维护)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">4</span> KV Cache 查找 <span class="role patch">Patch + 继承</span></h3>
+        <ul>
+          <li>get_kv_cache_coordinator 工厂被 Patch 替换 (自维护)</li>
+          <li>AscendHybridKVCacheCoordinator 不动点迭代 (自维护)</li>
+          <li>CompressAttentionManager 逻辑块哈希 (自维护)</li>
+          <li>BlockPool / get_cached_block / cache_full_blocks (上游)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">5</span> Slot Mapping <span class="role custom">完全自定义</span></h3>
+        <ul>
+          <li>AscendBlockTables.compute_slot_mappings (自维护)</li>
+          <li>Triton kernel: position → block_number → slot_id (自维护)</li>
+          <li>NPU 优化: 整块加载 + tl.gather + CP interleaving (自维护)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">6</span> 异步队列 <span class="role upstream">上游框架 + 自维护回调</span></h3>
+        <ul>
+          <li>waiting / running / skipped_waiting (上游结构)</li>
+          <li>WAITING_FOR_REMOTE_KVS 状态 (上游)</li>
+          <li>_update_waiting_for_remote_kv 回调 (自维护)</li>
+          <li>partial-group hit 回退逻辑 (自维护)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">7</span> Prefill / Decode <span class="role upstream">上游框架 + 继承</span></h3>
+        <ul>
+          <li>NPUModelRunner(GPUModelRunner) (继承)</li>
+          <li>model.forward() 各层计算 (上游模型实现)</li>
+          <li>AscendSampler(Sampler) greedy/penalties (继承)</li>
+          <li>ACLGraph replay (自维护)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="num">8</span> 写 Cache + 返回 <span class="role upstream">上游框架 + 继承</span></h3>
+        <ul>
+          <li>update_from_output (继承扩展)</li>
+          <li>kv_cache_manager.cache_blocks → block_pool 注册 (上游)</li>
+          <li>finish_requests → free blocks (上游)</li>
+          <li>EngineCoreOutput → SSE / JSON (上游)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 3. 上游 vs 自维护对比表 ===== -->
+  <div class="section">
+    <h2>③ Prefix Cache: 上游 vs 自维护 对比矩阵</h2>
+    <div class="svg-wrap" style="padding:0; overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:22%">层级</th>
+            <th style="width:39%">上游 vLLM 提供</th>
+            <th style="width:39%">vllm-ascend 自维护</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Block Hash</strong></td>
+            <td>Request.block_hasher, SHA256 链式哈希, BlockHashList</td>
+            <td><span class="pill cu">无</span> 完全复用上游</td>
+          </tr>
+          <tr>
+            <td><strong>BlockPool</strong></td>
+            <td>hash→block 索引, get_cached_block, cache_full_blocks, touch, LRU evict</td>
+            <td><span class="pill cu">无</span> 完全复用上游</td>
+          </tr>
+          <tr>
+            <td><strong>KVCacheManager</strong></td>
+            <td>get_computed_blocks, allocate_slots, cache_blocks, free</td>
+            <td><span class="pill cu">无</span> 完全复用上游</td>
+          </tr>
+          <tr>
+            <td><strong>Coordinator 工厂</strong></td>
+            <td>get_kv_cache_coordinator() 默认实现</td>
+            <td><span class="pill pa">Patch</span> 替换为 AscendHybridKVCacheCoordinator</td>
+          </tr>
+          <tr>
+            <td><strong>Hybrid Coordinator</strong></td>
+            <td>HybridKVCacheCoordinator (简单 min-reduction)</td>
+            <td><span class="pill pa">继承</span> 不动点迭代 + per-group + partial-group hit</td>
+          </tr>
+          <tr>
+            <td><strong>FullAttentionManager</strong></td>
+            <td>find_longest_cache_hit, cache_blocks (物理块级)</td>
+            <td><span class="pill pa">继承</span> CompressAttentionManager (逻辑块级 ×compress_ratio)</td>
+          </tr>
+          <tr>
+            <td><strong>MambaManager</strong></td>
+            <td>MambaManager 基础实现</td>
+            <td><span class="pill pa">Patch</span> AscendMambaManager (DCP + external hit 修正)</td>
+          </tr>
+          <tr>
+            <td><strong>block size 计算</strong></td>
+            <td>resolve_kv_cache_block_sizes (多 group+DCP 报错)</td>
+            <td><span class="pill pa">Patch</span> 返回 lcm × dcp</td>
+          </tr>
+          <tr>
+            <td><strong>Scheduler 基础</strong></td>
+            <td>Scheduler 类, waiting/running 队列, SchedulerOutput</td>
+            <td><span class="pill cu">无</span> 完全复用上游</td>
+          </tr>
+          <tr>
+            <td><strong>Scheduler prefix 查找</strong></td>
+            <td>get_computed_blocks() 统一查找</td>
+            <td><span class="pill pa">继承</span> _get_computed_blocks_for_connector() PD 增强</td>
+          </tr>
+          <tr>
+            <td><strong>KV 异步加载</strong></td>
+            <td>WAITING_FOR_REMOTE_KVS 状态定义</td>
+            <td><span class="pill pa">继承</span> _update_waiting_for_remote_kv() 回调</td>
+          </tr>
+          <tr>
+            <td><strong>KV Cache Spec</strong></td>
+            <td>MLAAttentionSpec, FullAttentionSpec, SlidingWindowSpec</td>
+            <td><span class="pill cu">自定义</span> AscendMLAAttentionSpec (+compress_ratio)</td>
+          </tr>
+          <tr>
+            <td><strong>BlockTable</strong></td>
+            <td>GPU block_table + CUDA kernel</td>
+            <td><span class="pill cu">自定义</span> AscendBlockTables + Triton kernel</td>
+          </tr>
+          <tr>
+            <td><strong>KV Connector</strong></td>
+            <td>AbstractKVConnector 协议接口</td>
+            <td><span class="pill cu">自定义</span> Mooncake / AscendStore / RecomputeOffload</td>
+          </tr>
+          <tr>
+            <td><strong>Worker 执行</strong></td>
+            <td>GPUModelRunner.prepare_inputs, forward, sampler</td>
+            <td><span class="pill pa">继承</span> NPUModelRunner (PCP manager 替换等)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="legend">
+      <span><span class="pill up">上游</span> 完全复用</span>
+      <span><span class="pill pa">Patch/继承</span> 替换或扩展</span>
+      <span><span class="pill cu">自定义</span> 从零开发</span>
+    </div>
+  </div>
+
+  <!-- ===== 4. 关键文件索引 ===== -->
+  <div class="section">
+    <h2>④ 关键文件索引</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Platform Patch (全局级)</h3>
+        <ul style="font: var(--text-code); font-size:12px;">
+          <li>patch_kv_cache_coordinator.py — Coordinator 工厂 + 不动点迭代</li>
+          <li>patch_kv_cache_utils.py — block size 计算 (lcm × dcp)</li>
+          <li>patch_mamba_manager.py — Hybrid Mamba DCP 支持</li>
+          <li>patch_weight_transfer_engine.py — HCCL / NPUIPC</li>
+          <li>patch_mla_prefill_backend.py — 避免 flash_attn 依赖</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Worker Patch + 自定义</h3>
+        <ul style="font: var(--text-code); font-size:12px;">
+          <li>patch_v2/patch_block_table.py — AscendBlockTables 注入</li>
+          <li>core/recompute_scheduler.py — RecomputeScheduler (PD 增强)</li>
+          <li>core/single_type_kv_cache_manager.py — CompressAttentionManager</li>
+          <li>core/kv_cache_interface.py — Ascend MLASpec (+compress_ratio)</li>
+          <li>worker/v2/block_table.py — Triton slot_mapping kernel</li>
+          <li>worker/v2/model_runner.py — NPUModelRunner(GPUModelRunner)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 5. 核心结论 ===== -->
+  <div class="section">
+    <h2>⑤ 核心结论</h2>
+    <div class="card conclusion">
+      <p style="margin:0; font: var(--text-body);">
+        Prefix Cache 的<strong>基础设施</strong>（hash 链、BlockPool、KVCacheManager、Scheduler 框架、KVConnector 协议）<strong>完全复用上游</strong>。
+      </p>
+      <p style="margin:8px 0 0; font: var(--text-body);">
+        vllm-ascend 的自维护集中在 <strong>3 个 NPU 专属扩展点</strong>：
+      </p>
+      <ul>
+        <li><strong>压缩 MLA 逻辑块哈希</strong> — CompressAttentionManager 按 block_size × compress_ratio 聚合，避免物理块级误命中</li>
+        <li><strong>多 group 不动点迭代</strong> — AscendHybridKVCacheCoordinator 跨 MLA/SWA 组协调 cache hit 长度，支持 partial-group hit</li>
+        <li><strong>PD 分离 KV Transfer 链路</strong> — 本地 + 远端双重 prefix cache 查找 + 异步加载回调 + Mooncake/AscendStore 传输</li>
+      </ul>
+      <p style="margin:8px 0 0; font: var(--text-body); color: var(--text-muted);">
+        外加 NPU 专属的 BlockTable/Triton slot_mapping kernel 和 KV Cache Spec 扩展。
+      </p>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
