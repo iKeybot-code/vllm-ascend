@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vLLM Attention 技术与代码实现报告</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-dark: #1d4ed8;
+            --secondary: #64748b;
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --code-bg: #f1f5f9;
+            --border: #e2e8f0;
+            --text: #1e293b;
+            --text-light: #475569;
+            --accent: #f59e0b;
+            --success: #10b981;
+            --danger: #ef4444;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+        }
+        header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white;
+            padding: 3rem 1.5rem;
+            text-align: center;
+        }
+        header h1 { margin: 0; font-size: 2.25rem; }
+        header p { margin: 0.75rem 0 0; opacity: 0.9; font-size: 1.1rem; }
+        nav {
+            position: sticky;
+            top: 0;
+            background: rgba(255,255,255,0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border);
+            padding: 0.75rem 1.5rem;
+            z-index: 100;
+            overflow-x: auto;
+        }
+        nav ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            gap: 1rem;
+            white-space: nowrap;
+        }
+        nav a {
+            color: var(--text-light);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            padding: 0.35rem 0.6rem;
+            border-radius: 0.35rem;
+            transition: all 0.2s;
+        }
+        nav a:hover { background: var(--code-bg); color: var(--primary); }
+        main {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 2rem 1.5rem 4rem;
+        }
+        section {
+            background: var(--card-bg);
+            border-radius: 1rem;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid var(--border);
+        }
+        h2 {
+            color: var(--primary);
+            margin-top: 0;
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 0.5rem;
+        }
+        h3 { color: var(--text); margin-top: 1.75rem; }
+        h4 { color: var(--text-light); margin-top: 1.5rem; }
+        p { color: var(--text-light); }
+        ul, ol { color: var(--text-light); }
+        li { margin: 0.35rem 0; }
+        .tag {
+            display: inline-block;
+            background: var(--code-bg);
+            color: var(--primary);
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.2rem 0.5rem;
+            border-radius: 0.25rem;
+            margin-right: 0.4rem;
+            border: 1px solid var(--border);
+        }
+        .tag-hot { background: #fef3c7; color: #92400e; }
+        .tag-npu { background: #dbeafe; color: #1e40af; }
+        .formula {
+            background: var(--code-bg);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            font-family: "Courier New", Courier, monospace;
+            overflow-x: auto;
+            margin: 1rem 0;
+            border-left: 4px solid var(--primary);
+        }
+        code {
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+            background: var(--code-bg);
+            padding: 0.15rem 0.35rem;
+            border-radius: 0.25rem;
+            font-size: 0.9em;
+            color: #c7254e;
+        }
+        pre {
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 1.25rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+        pre .comment { color: #64748b; }
+        pre .keyword { color: #c084fc; }
+        pre .string { color: #4ade80; }
+        pre .func { color: #60a5fa; }
+        .file-link {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .file-link:hover { text-decoration: underline; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+        }
+        th, td {
+            text-align: left;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+        th { background: var(--code-bg); color: var(--text); font-weight: 600; }
+        tr:hover td { background: #f8fafc; }
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+        .card {
+            background: var(--code-bg);
+            border-radius: 0.75rem;
+            padding: 1.25rem;
+            border: 1px solid var(--border);
+        }
+        .card h4 { margin-top: 0; color: var(--primary); }
+        .highlight {
+            background: #eff6ff;
+            border-left: 4px solid var(--primary);
+            padding: 1rem;
+            border-radius: 0 0.5rem 0.5rem 0;
+            margin: 1rem 0;
+        }
+        .warning {
+            background: #fffbeb;
+            border-left: 4px solid var(--accent);
+            padding: 1rem;
+            border-radius: 0 0.5rem 0.5rem 0;
+            margin: 1rem 0;
+        }
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-light);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border);
+        }
+        .mermaid {
+            background: var(--code-bg);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin: 1rem 0;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>vLLM Attention 技术与代码实现全景报告</h1>
+        <p>基于 vLLM 与 vllm-ascend 代码库的大模型 Attention 机制解析</p>
+    </header>
+
+    <nav>
+        <ul>
+            <li><a href="#overview">概述</a></li>
+            <li><a href="#basic">基础架构</a></li>
+            <li><a href="#paged">PagedAttention</a></li>
+            <li><a href="#flash">FlashAttention</a></li>
+            <li><a href="#chunked">Chunked Prefill</a></li>
+            <li><a href="#spec">投机解码</a></li>
+            <li><a href="#prefix">Prefix Caching</a></li>
+            <li><a href="#swa">Sliding Window</a></li>
+            <li><a href="#mla">MLA</a></li>
+            <li><a href="#sparse">稀疏 Attention</a></li>
+            <li><a href="#dcp">DCP</a></li>
+            <li><a href="#quant">量化</a></li>
+            <li><a href="#cross">Cross Attention</a></li>
+            <li><a href="#mapping">代码映射</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section id="overview">
+            <h2>1. 概述</h2>
+            <p>
+                vLLM 作为当前主流的大模型推理引擎，其核心竞争力之一在于对 <strong>Attention 计算</strong>的深度优化。
+                本报告系统梳理 vLLM（含 vllm-ascend NPU 插件）中涉及的主要 Attention 技术，包括：
+                基础多头注意力变体、PagedAttention、FlashAttention 系列、Chunked Prefill、投机解码、
+                Prefix Caching、Sliding Window、MLA、稀疏 Attention、Decode Context Parallelism、量化 Attention 以及 Cross Attention。
+                每个技术均给出原理说明、典型使用场景及在 vllm-ascend 中的关键代码位置。
+            </p>
+            <div class="card-grid">
+                <div class="card">
+                    <h4>计算优化</h4>
+                    <p>FlashAttention、MLA、DSA/SFA 通过算子融合、KV 压缩、稀疏选择降低显存与计算量。</p>
+                </div>
+                <div class="card">
+                    <h4>调度优化</h4>
+                    <p>PagedAttention、Chunked Prefill、Prefix Caching 提升批次利用率与 KV Cache 复用。</p>
+                </div>
+                <div class="card">
+                    <h4>并行优化</h4>
+                    <p>Decode Context Parallelism (DCP)、Sequence Parallelism 分散长序列 decode 压力。</p>
+                </div>
+                <div class="card">
+                    <h4>硬件适配</h4>
+                    <p>vllm-ascend 针对昇腾 NPU 提供 FIA、PA、FA3、SFA、DSA 等 NPU 原生算子路径。</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="basic">
+            <h2>2. Attention 基础架构</h2>
+
+            <h3>2.1 标准 Multi-Head Attention (MHA)</h3>
+            <p>
+                MHA 是 Transformer 的原始注意力形式。每个 token 的 Query、Key、Value 被投影到多组头空间，
+                每组头独立计算 Scaled Dot-Product Attention，最后拼接并投影输出。
+            </p>
+            <div class="formula">
+                Attention(Q, K, V) = softmax(QK<sup>T</sup> / √d<sub>k</sub>) V
+            </div>
+            <p>
+                在 vLLM 中，MHA 仍是通用后端（如 <code>CUSTOM</code> backend）的基础假设。
+                vllm-ascend 的 <code>AscendAttentionBackendImpl</code> 默认按 <code>num_heads / num_kv_heads</code>
+                计算 <code>num_queries_per_kv</code>，兼容 MHA 与 GQA/MQA。
+            </p>
+
+            <h3>2.2 Multi-Query Attention (MQA)</h3>
+            <p>
+                MQA 让多个 Query 头共享同一组 Key/Value 头（<code>num_kv_heads = 1</code>），
+                显著降低 KV Cache 显存占用与内存带宽压力，是长上下文 decode 的重要优化。
+            </p>
+
+            <h3>2.3 Grouped-Query Attention (GQA)</h3>
+            <p>
+                GQA 是 MHA 与 MQA 的折中：Query 头被划分为若干组，每组共享一个 KV 头
+                （<code>1 < num_kv_heads < num_heads</code>）。vLLM 的多数模型默认走 GQA 路径，
+                vllm-ascend 的 FIA/PA 算子均通过 <code>num_key_value_heads</code> 参数支持 GQA。
+            </p>
+
+            <div class="highlight">
+                <strong>代码关联：</strong>在 <code>AscendAttentionBackendImpl.__init__</code> 中，
+                通过 <code>self.num_queries_per_kv = self.num_heads // self.num_kv_heads</code> 统一处理 MHA/GQA/MQA 的重复广播逻辑。
+            </div>
+        </section>
+
+        <section id="paged">
+            <h2>3. PagedAttention</h2>
+            <p>
+                <span class="tag tag-hot">核心创新</span>
+                PagedAttention 是 vLLM 成名的关键技术。它将 KV Cache 组织为固定大小的 block（默认 128 tokens），
+                通过逻辑 block table 将非连续的物理 block 映射到每个请求的逻辑序列，
+                从而消除内存碎片、支持动态扩缩容，并允许不同请求共享同一段物理 KV。
+            </p>
+
+            <h3>3.1 核心思想</h3>
+            <ul>
+                <li><strong>Block 化：</strong>KV Cache 不再按连续大 tensor 分配，而是拆成 <code>[num_blocks, block_size, num_kv_heads, head_size]</code>。</li>
+                <li><strong>Block Table：</strong>每个请求维护一张逻辑到物理 block 索引表。</li>
+                <li><strong>Copy-on-Write：</strong>共享 block 在需要写入时被复制，保证解码正确性。</li>
+                <li><strong>Decode 优化：</strong>Decode 阶段每个请求仅生成 1 个（或少量）新 token，适合按 block 索引直接读取历史 KV。</li>
+            </ul>
+
+            <h3>3.2 vllm-ascend 中的实现</h3>
+            <p>
+                vllm-ascend 在 decode-only 且满足形状条件时，会调用昇腾 NPU 的 <code>_npu_paged_attention</code> 算子。
+                该算子直接以 block table 和 context lens 为输入，跳过显式构造大 KV tensor 的过程。
+            </p>
+            <pre><code><span class="comment"># vllm_ascend/attention/attention_v1.py</span>
+<span class="keyword">def</span> <span class="func">forward_paged_attention</span>(self, query, attn_metadata, output):
+    torch_npu._npu_paged_attention(
+        query=query,
+        key_cache=self.key_cache,
+        value_cache=self.value_cache,
+        num_kv_heads=self.num_kv_heads,
+        num_heads=self.num_heads,
+        scale_value=self.scale,
+        block_table=attn_metadata.block_tables,
+        context_lens=attn_metadata.seq_lens,
+        out=output,
+    )
+    <span class="keyword">return</span> output
+
+<span class="comment"># Graph capture 路径使用 full_graph_pa 保存 workspace 与 handle</span>
+<span class="keyword">def</span> <span class="func">full_graph_pa</span>(self, query, attn_metadata, output):
+    workspace = torch_npu._npu_paged_attention_get_workspace(...)
+    torch.npu.graph_task_group_begin(stream)
+    torch_npu._npu_paged_attention(...)
+    handle = torch.npu.graph_task_group_end(stream)</code></pre>
+
+            <h3>3.3 启用条件</h3>
+            <p>
+                <code>using_paged_attention()</code> 函数决定是否走 PA 路径，排除条件包括：
+                启用投机解码、A5 设备、非 FULL_DECODE_ONLY graph 模式、当前 batch shape 不在 <code>pa_shape_list</code> 内。
+            </p>
+        </section>
+
+        <section id="flash">
+            <h2>4. FlashAttention 系列</h2>
+            <p>
+                FlashAttention 通过分块（tiling）和重计算（recomputation）在 SRAM 中完成 Attention 计算，
+                避免构造巨大的 <code>N×N</code> attention score matrix，显著降低 HBM 读写量。
+            </p>
+
+            <h3>4.1 FlashAttention / FlashAttention-2</h3>
+            <ul>
+                <li>减少 HBM 访问量，支持 causal mask 与任意序列长度。</li>
+                <li>在 vLLM 中常以 <code>FLASH_ATTN</code> backend 形式存在，v1 与 v0 架构均有对应实现。</li>
+            </ul>
+
+            <h3>4.2 FlashAttention-3 (FA3)</h3>
+            <p>
+                FA3 针对 Hopper 等新一代 GPU 优化，但在 vllm-ascend 中，
+                <code>AscendFABackend</code> 通过 <code>flash_attn_npu_v3</code> 库在 NPU 上提供类似语义的实现。
+                它调用 <code>flash_attn_with_kvcache</code>，支持 page table、cumulative seqlens、causal 等参数。
+            </p>
+            <pre><code><span class="comment"># vllm_ascend/attention/fa3_v1.py</span>
+<span class="keyword">class</span> <span class="func">AscendFAImpl</span>(AscendAttentionBackendImpl):
+    <span class="keyword">def</span> <span class="func">_flash_attn_with_kvcache</span>(self, query, block_table, actual_seq_lengths,
+                                  seq_lens, is_causal, max_seq_len):
+        attn_output = _fa3_fn(
+            query,
+            key_fa_blk, value_fa_blk,
+            cache_seqlens=seq_lens,
+            page_table=block_table,
+            cu_seqlens_q=actual_seq_lengths,
+            max_seqlen_q=max_seq_len,
+            causal=is_causal,
+            ...
+        )
+        <span class="keyword">return</span> attn_output</code></pre>
+
+            <h3>4.3 Fused Infer Attention (FIA) — 昇腾原生</h3>
+            <p>
+                vllm-ascend 默认 backend <code>CUSTOM</code> 实际调用的是昇腾 <code>npu_fused_infer_attention_score</code> 系列算子，
+                包括 V1 与 V2。它同时覆盖 prefill、decode、chunked prefill、sliding window 等多种场景，
+                输入布局采用 <code>TND</code>（token、head、dim），通过 <code>actual_seq_lengths</code> 描述变长序列。
+            </p>
+            <pre><code><span class="comment"># vllm_ascend/attention/attention_v1.py forward_fused_infer_attention</span>
+torch_npu.npu_fused_infer_attention_score(
+    query=query, key=key, value=value,
+    block_table=block_table,
+    input_layout=<span class="string">"TND"</span>,
+    block_size=block_size,
+    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+    actual_seq_lengths_kv=actual_seq_lengths_kv,
+    num_key_value_heads=self.num_kv_heads,
+    num_heads=self.num_heads,
+    scale=self.scale,
+    sparse_mode=3,  <span class="comment"># causal</span>
+    ...
+)</code></pre>
+
+            <h3>4.4 Sliding Window Attention (SWA)</h3>
+            <p id="swa">
+                当模型配置 <code>sliding_window</code> 时，FIA 使用 <code>sparse_mode=4</code> 与 <code>pre_tokens=sliding_window</code>
+                限制每个 token 只能 attend 到左侧固定窗口内的 KV，降低长序列 decode 的内存与计算。
+            </p>
+        </section>
+
+        <section id="chunked">
+            <h2>5. Chunked Prefill (SplitFuse)</h2>
+            <p>
+                <span class="tag tag-hot">调度核心</span>
+                Chunked Prefill 将长预填充请求切分成多个 chunk，与 decode 请求混合调度到同一个 batch 中执行，
+                从而避免单个长 prefill 阻塞所有 decode 请求，提升整体吞吐。
+            </p>
+            <ul>
+                <li>同一 batch 内可能同时存在 decode token 与 prefill token。</li>
+                <li>需要构造特殊的 attention mask，让 prefill chunk 只能看到已生成的历史 tokens。</li>
+                <li>在昇腾 A5 上，当混合 prefill/decode 时会拆成两次 FIA 调用分别执行。</li>
+            </ul>
+            <pre><code><span class="comment"># vllm_ascend/attention/attention_v1.py _forward_fia_chunked_prefill_split</span>
+<span class="keyword">if</span> is_950() <span class="keyword">and</span> attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill \
+        <span class="keyword">and</span> attn_metadata.num_decodes > 0 <span class="keyword">and</span> attn_metadata.num_prefills > 0:
+    <span class="keyword">return</span> self._forward_fia_chunked_prefill_split(...)</code></pre>
+            <p>
+                <code>AttentionMaskBuilder.get_splitfuse_attn_mask()</code> 提供 2048×2048 的上三角 mask，
+                用于 chunked prefill 场景。
+            </p>
+        </section>
+
+        <section id="spec">
+            <h2>6. 投机解码 (Speculative Decoding)</h2>
+            <p>
+                投机解码通过小模型（draft）快速生成候选 token，再由大模型（target）一次验证多个 token，
+                在 accept 率较高时可显著降低每个有效 token 的平均延迟。
+            </p>
+
+            <h3>6.1 Attention 层面的变化</h3>
+            <ul>
+                <li>Decode 阶段每个请求可能一次性处理多个候选 token（<code>num_speculative_tokens > 1</code>）。</li>
+                <li><code>decode_threshold</code> 被调整为 <code>1 + num_speculative_tokens</code>，且不能超过 16。</li>
+                <li>需要为 draft 模型单独捕获 graph 参数（<code>get_draft_graph_params</code>）。</li>
+            </ul>
+
+            <h3>6.2 vllm-ascend 中的投机路径</h3>
+            <p>
+                <code>AscendAttentionState.SpecDecoding</code> 标记投机状态。
+                在 graph replay 更新时，<code>attn_keys</code> 可能需要按 layer 索引重排，
+                并对 draft 模型的多步 metadata 进行循环展开。
+            </p>
+            <div class="warning">
+                <strong>注意：</strong>当启用投机解码时，<code>using_paged_attention()</code> 会返回 False，
+                即投机场景不走 NPU PagedAttention，而走 FIA 路径。
+            </div>
+        </section>
+
+        <section id="prefix">
+            <h2>7. Prefix Caching</h2>
+            <p>
+                Prefix Caching 对输入 prompt 的公共前缀进行 KV Cache 复用。vLLM 的 block manager 会追踪每个物理 block 的 hash，
+                当新请求前缀命中已缓存 block 时，直接复用而无需重新计算。
+            </p>
+            <ul>
+                <li>命中缓存时，Attention 状态为 <code>PrefillCacheHit</code>。</li>
+                <li>未命中或纯新 prompt 时为 <code>PrefillNoCache</code>。</li>
+                <li>Decode 阶段为 <code>DecodeOnly</code>。</li>
+            </ul>
+            <p>
+                在 vllm-ascend 中，<code>AscendAttentionMetadataBuilder</code> 根据 <code>common_attn_metadata.attn_state</code>
+                选择不同的 block_table 与 seq_lens 处理路径；<code>_get_fia_params</code> 针对
+                <code>PrefillNoCache</code>、<code>PrefillCacheHit</code>、<code>DecodeOnly</code>
+                分别构造 key/value 视图与 block table。
+            </p>
+        </section>
+
+        <section id="mla">
+            <h2>8. Multi-head Latent Attention (MLA)</h2>
+            <p>
+                <span class="tag tag-hot">模型级优化</span>
+                MLA 是 DeepSeek-V2/V3 等模型引入的注意力压缩技术。它通过低秩压缩将 Key/Value 投影到一个小的 latent 空间，
+                大幅降低 KV Cache 大小，同时通过解耦 RoPE 保持位置编码能力。
+            </p>
+
+            <h3>8.1 核心思想</h3>
+            <ul>
+                <li><strong>Q 侧压缩：</strong>Query 先投影到低秩空间 <code>q_lora_rank</code>，再恢复到多头。</li>
+                <li><strong>KV 侧压缩：</strong>Key/Value 共享一个 <code>kv_lora_rank</code> 的 latent vector，仅保留独立的 RoPE 部分。</li>
+                <li><strong>Cache 形状：</strong>从 <code>[seq_len, num_kv_heads, head_size]</code> 变为 <code>[seq_len, kv_lora_rank]</code>，显存显著下降。</li>
+            </ul>
+
+            <h3>8.2 vllm-ascend 中的 MLA 后端</h3>
+            <p>
+                vllm-ascend 提供专门的 <code>ASCEND_MLA</code> backend，实现类为 <code>AscendMLAImpl</code>，
+                metadata builder 为 <code>AscendMLAMetadataBuilder</code>。
+                当开启 Decode Context Parallelism 时，会切换为 <code>AscendMlaDCPImpl</code> / <code>AscendMlaDCPMetadataBuilder</code>。
+            </p>
+            <pre><code><span class="comment"># vllm_ascend/attention/mla_v1.py</span>
+<span class="keyword">class</span> <span class="func">AscendMLABackend</span>(AttentionBackend):
+    <span class="keyword">def</span> <span class="func">get_name</span>(self): <span class="keyword">return</span> <span class="string">"ASCEND_MLA"</span>
+    <span class="keyword">def</span> <span class="func">get_impl_cls</span>(self):
+        <span class="keyword">if</span> enable_dcp(): <span class="keyword">return</span> AscendMlaDCPImpl
+        <span class="keyword">return</span> AscendMLAImpl
+    <span class="keyword">def</span> <span class="func">get_kv_cache_shape</span>(...):
+        <span class="keyword">return</span> num_blocks, block_size, num_kv_heads, head_size</code></pre>
+
+            <h3>8.3 自定义算子封装</h3>
+            <p>
+                <code>vllm_ascend/ops/mla.py</code> 中的 <code>AscendMultiHeadLatentAttention</code>
+                包装了上游 <code>MLAAttention</code>，并通过 <code>torch.ops.vllm.mla_forward</code> 自定义算子
+                在 NPU 上执行前向，支持 TP gather、KV cache 等逻辑。
+            </p>
+        </section>
+
+        <section id="sparse">
+            <h2>9. 稀疏 Attention</h2>
+            <p>
+                针对超长上下文，稀疏 Attention 通过选择性地只 attend 到关键 KV，进一步降低计算与显存。
+                vllm-ascend 中主要有两条路径：SFA 与 DSA。
+            </p>
+
+            <h3>9.1 SFA (Sparse Flash Attention)</h3>
+            <p>
+                <code>ASCEND_SFA</code> backend 用于支持 DeepSeek-V4 等模型的稀疏 MLA。
+                它维护 top-k 稀疏索引，将 KV 分为常驻（resident）与离载（offload）两层，
+                在 decode 时仅加载必要的 top-k KV block。
+            </p>
+            <pre><code><span class="comment"># vllm_ascend/attention/sfa_v1.py</span>
+<span class="keyword">class</span> <span class="func">AscendSFABackend</span>(AttentionBackend):
+    <span class="keyword">def</span> <span class="func">get_name</span>(self): <span class="keyword">return</span> <span class="string">"ASCEND_SFA"</span>
+    <span class="keyword">def</span> <span class="func">get_impl_cls</span>(self):
+        <span class="keyword">if</span> sparse_kv_offload: <span class="keyword">return</span> AscendSFAKVOffloadImpl
+        <span class="keyword">if</span> dcp: <span class="keyword">return</span> AscendSFADCPImpl
+        <span class="keyword">return</span> AscendSFAImpl</code></pre>
+
+            <h3>9.2 DSA (DeepSeek Sparse Attention / Dynamic Sparse Attention)</h3>
+            <p>
+                <code>ASCEND_DSA</code> backend 在 <code>vllm_ascend/attention/dsa_v1.py</code> 中定义，
+                主要用于 DeepSeek-V4 的稀疏注意力。它通过压缩、Hadamard 变换、压缩 mask 等技术，
+                在 prefill 阶段对 KV 进行压缩，decode 阶段按压缩后的索引进行稀疏注意力计算。
+            </p>
+            <ul>
+                <li><code>_npu_flash_attention_v3</code> 支持 <code>mask_type=MASK_TYPE_NORM_COMPRESS_SELF_ATTENTION</code> 等压缩 mask。</li>
+                <li>DSA 可与 DCP 结合，形成 <code>AscendDSACPImpl</code>。</li>
+            </ul>
+        </section>
+
+        <section id="dcp">
+            <h2>10. Decode Context Parallelism (DCP)</h2>
+            <p>
+                DCP 将长序列的 decode 阶段 KV 沿序列维度切分到多个 TP/DP 组上并行计算，
+                每个 rank 负责一段 local KV，最后通过 all-gather / reduce-scatter 合并结果。
+                它主要解决超长上下文 decode 时单个 rank KV 放不下的问题。
+            </p>
+
+            <h3>10.1 vllm-ascend 中的 DCP 实现</h3>
+            <ul>
+                <li>普通 Attention：<code>AscendAttentionDCPImpl</code> / <code>AscendAttentionDCPMetadataBuilder</code></li>
+                <li>MLA：<code>AscendMlaDCPImpl</code> / <code>AscendMlaDCPMetadataBuilder</code></li>
+                <li>SFA：<code>AscendSFADCPImpl</code> / <code>AscendSFADCPMetadataBuilder</code></li>
+                <li>DSA：<code>AscendDSACPImpl</code> / <code>AscendDSACPMetadataBuilder</code></li>
+            </ul>
+            <p>
+                当 <code>parallel_config.decode_context_parallel_size > 1</code> 时，
+                <code>enable_dcp()</code> 返回 True，各 backend 自动切换到 DCP 实现。
+            </p>
+        </section>
+
+        <section id="quant">
+            <h2>11. 量化 Attention</h2>
+            <p>
+                量化 Attention 主要关注 KV Cache 的 INT8/FP8 压缩，以降低长上下文下的显存占用。
+                vllm-ascend 提供 <code>AscendC8AttentionBackendImpl</code> 处理 C8（per-channel INT8）KV cache。
+            </p>
+
+            <h3>11.1 C8 KV Cache 路径</h3>
+            <ul>
+                <li>在 prefill 阶段将 key/value 量化为 INT8 并写入 KV cache。</li>
+                <li>decode 阶段通过 antiquant scale 反量化后参与 FIA 计算，或使用 NZ 5D 布局直接传入 antiquant 参数。</li>
+                <li>通过 <code>key_antiquant_scale / value_antiquant_scale</code> 等参数与 FIA 融合。</li>
+            </ul>
+            <pre><code><span class="comment"># AscendC8AttentionBackendImpl 示例</span>
+extra_args = {
+    <span class="string">"key_antiquant_scale"</span>: layer._c8_k_aq_scale_nz_bnsd,
+    <span class="string">"value_antiquant_scale"</span>: layer._c8_v_aq_scale_nz_bnsd,
+    <span class="string">"key_antiquant_mode"</span>: 0,
+    <span class="string">"value_antiquant_mode"</span>: 0,
+    <span class="string">"inner_precise"</span>: 1,
+}</code></pre>
+        </section>
+
+        <section id="cross">
+            <h2>12. Cross Attention / Encoder-Decoder</h2>
+            <p>
+                在 encoder-decoder 模型与 VL 模型中，decoder 需要 attend 到 encoder 的输出（如图像编码、源语言文本）。
+                vllm-ascend 通过 <code>AttentionType.ENCODER_DECODER</code> 与 <code>AttentionType.ENCODER_ONLY</code>
+                区分因果自注意力与双向交叉注意力。
+            </p>
+            <ul>
+                <li><code>ENCODER_ONLY</code> 使用无因果 mask 的 <code>npu_fusion_attention</code>。</li>
+                <li><code>ENCODER_DECODER</code> 的 prefill 阶段，<code>actual_seq_lengths_kv</code> 使用 <code>torch.cumsum(seq_lens)</code> 构造。</li>
+                <li>pooling 模型走 <code>_forward_encoder_attention</code> 分支。</li>
+            </ul>
+        </section>
+
+        <section id="mapping">
+            <h2>13. 关键代码映射表</h2>
+            <p>下表汇总了各 Attention 技术在 vllm-ascend 中的主要实现文件与关键类/函数。</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>技术</th>
+                        <th>核心文件</th>
+                        <th>关键类/函数</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>通用 Attention Backend</td>
+                        <td>vllm_ascend/attention/attention_v1.py</td>
+                        <td>AscendAttentionBackend, AscendAttentionBackendImpl, AscendMetadata</td>
+                        <td>CUSTOM backend，覆盖 MHA/GQA/MQA/ChunkedPrefill/SpecDecoding</td>
+                    </tr>
+                    <tr>
+                        <td>PagedAttention</td>
+                        <td>vllm_ascend/attention/attention_v1.py</td>
+                        <td>forward_paged_attention, full_graph_pa, using_paged_attention</td>
+                        <td>Decode-only NPU paged attention 与 graph capture</td>
+                    </tr>
+                    <tr>
+                        <td>FIA (昇腾融合算子)</td>
+                        <td>vllm_ascend/attention/attention_v1.py</td>
+                        <td>forward_fused_infer_attention, full_graph_fia, full_graph_fia_v2</td>
+                        <td>npu_fused_infer_attention_score V1/V2，TND 布局</td>
+                    </tr>
+                    <tr>
+                        <td>FlashAttention-3</td>
+                        <td>vllm_ascend/attention/fa3_v1.py</td>
+                        <td>AscendFABackend, AscendFAImpl</td>
+                        <td>调用 flash_attn_npu_v3 库，拆 prefill/decode 执行</td>
+                    </tr>
+                    <tr>
+                        <td>MLA</td>
+                        <td>vllm_ascend/attention/mla_v1.py</td>
+                        <td>AscendMLABackend, AscendMLAImpl, AscendMLAMetadataBuilder</td>
+                        <td>DeepSeek MLA 的昇腾实现</td>
+                    </tr>
+                    <tr>
+                        <td>MLA 算子封装</td>
+                        <td>vllm_ascend/ops/mla.py</td>
+                        <td>AscendMultiHeadLatentAttention, mla_forward</td>
+                        <td>自定义 torch.ops.vllm.mla_forward 算子</td>
+                    </tr>
+                    <tr>
+                        <td>SFA</td>
+                        <td>vllm_ascend/attention/sfa_v1.py</td>
+                        <td>AscendSFABackend, AscendSFAImpl, AscendSFAMetadataBuilder</td>
+                        <td>Sparse Flash Attention，含 KV offload 与 DCP 变体</td>
+                    </tr>
+                    <tr>
+                        <td>DSA</td>
+                        <td>vllm_ascend/attention/dsa_v1.py</td>
+                        <td>AscendDSABackend, AscendDSAImpl, AscendDSAMetadataBuilder</td>
+                        <td>DeepSeek 稀疏注意力，含压缩 mask</td>
+                    </tr>
+                    <tr>
+                        <td>DCP</td>
+                        <td>vllm_ascend/attention/context_parallel/*.py</td>
+                        <td>AscendAttentionDCPImpl, AscendMlaDCPImpl, AscendSFADCPImpl, AscendDSACPImpl</td>
+                        <td>Decode Context Parallelism 各 backend 适配</td>
+                    </tr>
+                    <tr>
+                        <td>Attention Mask</td>
+                        <td>vllm_ascend/attention/attention_mask.py</td>
+                        <td>AttentionMaskBuilder</td>
+                        <td>因果 mask、SplitFuse mask、MLA mask 生成</td>
+                    </tr>
+                    <tr>
+                        <td>C8 量化</td>
+                        <td>vllm_ascend/attention/attention_v1.py</td>
+                        <td>AscendC8AttentionBackendImpl</td>
+                        <td>INT8 KV cache  antiquant 与 FIA 融合</td>
+                    </tr>
+                    <tr>
+                        <td>通用工具</td>
+                        <td>vllm_ascend/attention/utils.py</td>
+                        <td>AscendCommonAttentionMetadata, using_paged_attention, enable_dcp</td>
+                        <td>公共 metadata、PA 判断、DCP 开关</td>
+                    </tr>
+                    <tr>
+                        <td>310P 专用</td>
+                        <td>vllm_ascend/_310p/attention/attention_v1.py</td>
+                        <td>AscendAttentionBackend310, AscendAttentionBackendImpl310</td>
+                        <td>Ascend 310P 设备的 FlashAttention / PagedAttention</td>
+                    </tr>
+                    <tr>
+                        <td>v2 Worker Attention</td>
+                        <td>vllm_ascend/worker/v2/attn_utils.py</td>
+                        <td>build_attn_state, AscendMLAAttentionSpec</td>
+                        <td>v2 model runner 中 attention 状态构建与 spec 生成</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section>
+            <h2>14. 总结</h2>
+            <p>
+                vLLM 的 Attention 体系可以概括为“一个通用后端 + 多个专用后端 + 硬件原生算子”：
+            </p>
+            <ol>
+                <li><strong>通用后端</strong> <code>AscendAttentionBackend</code> 通过 FIA 算子覆盖绝大多数场景；</li>
+                <li><strong>PagedAttention</strong> 在 decode-only 且满足条件时提供极致性能；</li>
+                <li><strong>FlashAttention-3</strong> 作为可选高性能路径；</li>
+                <li><strong>MLA/SFA/DSA</strong> 针对 DeepSeek 等模型做结构级压缩与稀疏优化；</li>
+                <li><strong>DCP</strong> 将超长序列 decode 压力分散到多 rank；</li>
+                <li><strong>Chunked Prefill + Prefix Caching + Speculative Decoding</strong> 在调度层进一步提升吞吐与延迟；</li>
+                <li><strong>量化 Attention</strong> 与 <strong>Cross Attention</strong> 覆盖生产环境中的显存与多模态需求。</li>
+            </ol>
+            <p>
+                理解这些技术之间的组合关系（例如 MLA + DCP + Chunked Prefill），
+                是进行 vLLM/vllm-ascend 性能调优与问题定位的关键。
+            </p>
+        </section>
+    </main>
+
+    <footer>
+        <p>Generated by TRAE Code Assistant · 基于 vllm-ascend 代码库分析生成</p>
+    </footer>
+</body>
+</html>
