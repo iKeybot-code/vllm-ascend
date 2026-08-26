@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MoE 混合专家网络技术报告</title>
+    <style>
+        :root {
+            --bg: #fafafa;
+            --surface: #ffffff;
+            --surface-raised: #f5f5f7;
+            --text: #1d1d1f;
+            --text-secondary: #6e6e73;
+            --border: rgba(0, 0, 0, 0.08);
+            --brand: #4b3fe3;
+            --brand-soft: #f2f7ff;
+            --brand-text: #1a1759;
+            --accent: #27d2bf;
+            --accent-soft: #eafbf8;
+            --code-bg: #f4f4f5;
+            --radius: 12px;
+            --radius-lg: 18px;
+            --shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0d0d0f;
+                --surface: #17171a;
+                --surface-raised: #1f1f24;
+                --text: #f5f5f7;
+                --text-secondary: #a1a1aa;
+                --border: rgba(255, 255, 255, 0.08);
+                --brand: #6054f1;
+                --brand-soft: #1a1759;
+                --brand-text: #cfd8ff;
+                --accent: #27d2bf;
+                --accent-soft: #123f3c;
+                --code-bg: #1a1a1e;
+                --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+            }
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+            font-size: 16px;
+        }
+
+        .container {
+            max-width: 920px;
+            margin: 0 auto;
+            padding: 48px 24px;
+        }
+
+        /* Hero */
+        .hero {
+            text-align: center;
+            padding: 72px 24px;
+            background: linear-gradient(135deg, var(--brand-soft) 0%, var(--surface) 100%);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border);
+            margin-bottom: 48px;
+            box-shadow: var(--shadow);
+        }
+
+        .hero h1 {
+            font-size: 42px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            margin-bottom: 16px;
+            color: var(--text);
+        }
+
+        .hero .subtitle {
+            font-size: 20px;
+            color: var(--text-secondary);
+            font-weight: 400;
+        }
+
+        .hero .meta {
+            margin-top: 32px;
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        /* TOC */
+        .toc {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 28px 32px;
+            margin-bottom: 48px;
+            box-shadow: var(--shadow);
+        }
+
+        .toc h2 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            color: var(--text);
+        }
+
+        .toc ul {
+            list-style: none;
+            columns: 2;
+            column-gap: 32px;
+        }
+
+        .toc li {
+            margin-bottom: 8px;
+            break-inside: avoid;
+        }
+
+        .toc a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 15px;
+            transition: color 0.2s;
+        }
+
+        .toc a:hover {
+            color: var(--brand);
+        }
+
+        @media (max-width: 640px) {
+            .toc ul {
+                columns: 1;
+            }
+        }
+
+        /* Sections */
+        section {
+            margin-bottom: 56px;
+        }
+
+        h2 {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid var(--border);
+            color: var(--text);
+        }
+
+        h3 {
+            font-size: 20px;
+            font-weight: 600;
+            margin: 32px 0 14px;
+            color: var(--text);
+        }
+
+        p {
+            margin-bottom: 16px;
+            color: var(--text-secondary);
+        }
+
+        strong {
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        /* Cards */
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 20px;
+            margin: 24px 0;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            box-shadow: var(--shadow);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h4 {
+            font-size: 17px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: var(--brand);
+        }
+
+        .card p {
+            font-size: 14px;
+            line-height: 1.6;
+            margin-bottom: 0;
+        }
+
+        /* Figures */
+        .figure {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            margin: 28px 0;
+            box-shadow: var(--shadow);
+            text-align: center;
+        }
+
+        .figure svg {
+            width: 100%;
+            height: auto;
+            max-width: 760px;
+        }
+
+        .figure-caption {
+            margin-top: 16px;
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        /* Code */
+        pre {
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            overflow-x: auto;
+            margin: 20px 0;
+            font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+            font-size: 13.5px;
+            line-height: 1.6;
+        }
+
+        code {
+            font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+            font-size: 0.92em;
+            background: var(--code-bg);
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: var(--text);
+        }
+
+        pre code {
+            background: transparent;
+            padding: 0;
+        }
+
+        .comment {
+            color: var(--text-secondary);
+        }
+
+        .keyword {
+            color: var(--brand);
+        }
+
+        /* Formula */
+        .formula {
+            background: var(--surface-raised);
+            border-left: 4px solid var(--brand);
+            padding: 18px 24px;
+            border-radius: 0 var(--radius) var(--radius) 0;
+            margin: 20px 0;
+            font-family: "Times New Roman", "STIX Two Math", serif;
+            font-size: 17px;
+            color: var(--text);
+        }
+
+        /* Lists */
+        ul, ol {
+            margin: 16px 0 16px 24px;
+            color: var(--text-secondary);
+        }
+
+        li {
+            margin-bottom: 8px;
+        }
+
+        /* Highlight */
+        .highlight {
+            background: var(--accent-soft);
+            border: 1px solid var(--accent);
+            border-radius: var(--radius);
+            padding: 18px 22px;
+            margin: 24px 0;
+        }
+
+        .highlight p {
+            margin: 0;
+            color: var(--text);
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 40px 0;
+            color: var(--text-secondary);
+            font-size: 14px;
+            border-top: 1px solid var(--border);
+        }
+
+        /* Table */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            background: var(--surface);
+            border-radius: var(--radius);
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+
+        th, td {
+            padding: 14px 18px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: var(--surface-raised);
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        td {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Hero -->
+        <header class="hero">
+            <h1>MoE 混合专家网络</h1>
+            <p class="subtitle">Mixture of Experts：架构、原理与工程实现</p>
+            <p class="meta">生成日期：2026-08-26 &nbsp;|&nbsp; 技术报告</p>
+        </header>
+
+        <!-- TOC -->
+        <nav class="toc">
+            <h2>目录</h2>
+            <ul>
+                <li><a href="#sec1">1. 概述与发展背景</a></li>
+                <li><a href="#sec2">2. 网络结构</a></li>
+                <li><a href="#sec3">3. 核心技术特点</a></li>
+                <li><a href="#sec4">4. 数学原理</a></li>
+                <li><a href="#sec5">5. PyTorch 逻辑实现</a></li>
+                <li><a href="#sec6">6. 专家并行与通信</a></li>
+                <li><a href="#sec7">7. 应用场景与挑战</a></li>
+                <li><a href="#sec8">8. 总结</a></li>
+            </ul>
+        </nav>
+
+        <!-- Section 1 -->
+        <section id="sec1">
+            <h2>1. 概述与发展背景</h2>
+            <p><strong>混合专家模型（Mixture of Experts, MoE）</strong>是一种通过"条件计算"实现模型容量扩展的神经网络架构。与传统稠密网络不同，MoE 为每个输入只激活部分参数，从而在显著增加总参数量的同时，控制每次前向传播的实际计算量。</p>
+            <p>MoE 的核心动机源于大模型训练中的两个矛盾：</p>
+            <ul>
+                <li><strong>容量需求：</strong>模型需要足够多的参数来学习海量知识；</li>
+                <li><strong>计算约束：</strong>每次推理的计算成本必须可控，不能随参数线性增长。</li>
+            </ul>
+            <p>在 Transformer 时代，MoE 最成功的应用是替代 Decoder/Encoder 层中的前馈网络（FFN）。代表工作包括 GShard、Switch Transformer、DeepSeek-V2/V3 等，它们将 MoE 推向了千亿乃至万亿参数规模。</p>
+        </section>
+
+        <!-- Section 2 -->
+        <section id="sec2">
+            <h2>2. 网络结构</h2>
+            <p>一个标准的 MoE 层由三个核心组件构成：多个专家网络（Experts）、一个门控网络（Gating Network / Router），以及 Top-K 选择器。下图展示了一个典型 MoE 层的内部结构。</p>
+
+            <figure class="figure">
+                <svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+                            <path d="M1 1 L7 4 L1 7 Z" fill="#6e6e73"/>
+                        </marker>
+                        <marker id="arrBrand" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+                            <path d="M1 1 L7 4 L1 7 Z" fill="#4b3fe3"/>
+                        </marker>
+                    </defs>
+
+                    <!-- Input -->
+                    <rect x="30" y="145" width="100" height="70" rx="10" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="80" y="180" text-anchor="middle" font-size="15" font-weight="600" fill="#1d1d1f">输入 x</text>
+                    <text x="80" y="202" text-anchor="middle" font-size="12" fill="#6e6e73">[B, hidden]</text>
+
+                    <!-- Router -->
+                    <rect x="180" y="120" width="150" height="120" rx="14" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="2"/>
+                    <text x="255" y="160" text-anchor="middle" font-size="16" font-weight="700" fill="#1a1759">门控网络 Router</text>
+                    <text x="255" y="185" text-anchor="middle" font-size="13" fill="#4b3fe3">Linear + Softmax</text>
+                    <text x="255" y="210" text-anchor="middle" font-size="12" fill="#6e6e73">输出各专家权重</text>
+
+                    <!-- Top-K -->
+                    <rect x="380" y="145" width="120" height="70" rx="10" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="440" y="178" text-anchor="middle" font-size="15" font-weight="600" fill="#1d1d1f">Top-K 选择</text>
+                    <text x="440" y="200" text-anchor="middle" font-size="12" fill="#6e6e73">选择 K 个专家</text>
+
+                    <!-- Experts -->
+                    <rect x="560" y="40" width="130" height="60" rx="10" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="625" y="75" text-anchor="middle" font-size="15" font-weight="600" fill="#6e6e73">Expert 1</text>
+
+                    <rect x="560" y="120" width="130" height="60" rx="10" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="2"/>
+                    <text x="625" y="155" text-anchor="middle" font-size="15" font-weight="600" fill="#1a1759">Expert 2</text>
+
+                    <rect x="560" y="200" width="130" height="60" rx="10" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="625" y="235" text-anchor="middle" font-size="15" font-weight="600" fill="#6e6e73">Expert 3</text>
+
+                    <rect x="560" y="280" width="130" height="60" rx="10" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="2"/>
+                    <text x="625" y="315" text-anchor="middle" font-size="15" font-weight="600" fill="#1a1759">Expert 4</text>
+
+                    <!-- Output -->
+                    <ellipse cx="255" cy="325" rx="70" ry="26" fill="#4b3fe3"/>
+                    <text x="255" y="330" text-anchor="middle" font-size="15" font-weight="600" fill="#ffffff">输出 y</text>
+
+                    <!-- Arrows -->
+                    <path d="M130 180 L180 180" stroke="#6e6e73" stroke-width="1.5" fill="none" marker-end="url(#arr)" stroke-linecap="round"/>
+                    <path d="M330 180 L380 180" stroke="#6e6e73" stroke-width="1.5" fill="none" marker-end="url(#arr)" stroke-linecap="round"/>
+                    <text x="355" y="170" text-anchor="middle" font-size="11" fill="#6e6e73">权重</text>
+
+                    <path d="M500 180 L560 150" stroke="#4b3fe3" stroke-width="2" fill="none" marker-end="url(#arrBrand)" stroke-linecap="round"/>
+                    <text x="540" y="138" text-anchor="middle" font-size="12" font-weight="600" fill="#4b3fe3">w₂</text>
+
+                    <path d="M500 195 Q530 310 560 310" stroke="#4b3fe3" stroke-width="2" fill="none" marker-end="url(#arrBrand)" stroke-linecap="round"/>
+                    <text x="540" y="322" text-anchor="middle" font-size="12" font-weight="600" fill="#4b3fe3">w₄</text>
+
+                    <!-- Expert outputs aggregated to final output -->
+                    <path d="M625 180 Q440 260 325 325" stroke="#4b3fe3" stroke-width="2" fill="none" marker-end="url(#arrBrand)" stroke-linecap="round"/>
+                    <path d="M625 280 Q440 325 325 325" stroke="#4b3fe3" stroke-width="2" fill="none" marker-end="url(#arrBrand)" stroke-linecap="round"/>
+                </svg>
+                <figcaption class="figure-caption">图 1：MoE 层内部结构。输入经过 Router 计算权重，Top-K 选择器挑选 K 个专家，最终加权聚合得到输出。</figcaption>
+            </figure>
+
+            <h3>2.1 专家网络（Experts）</h3>
+            <p>每个专家通常是一个独立的前馈网络（FFN），结构与标准 Transformer 中的 FFN 相同。在语言模型中，不同专家可能分别擅长语法、事实知识、代码、推理等不同模式。</p>
+
+            <h3>2.2 门控网络（Router）</h3>
+            <p>门控网络是一个轻量级的线性层，输入为 hidden states，输出为每个专家的得分。经过 Softmax 后得到概率分布，表示当前输入应该分配给哪些专家。</p>
+
+            <h3>2.3 Top-K 选择器</h3>
+            <p>从所有专家的概率分布中选取前 K 个。K 通常取 1、2 或 4。K=1 时称为 Switch Transformer 风格，K=2 是目前大模型中最常见的配置。</p>
+        </section>
+
+        <!-- Section 3 -->
+        <section id="sec3">
+            <h2>3. 核心技术特点</h2>
+            <div class="card-grid">
+                <div class="card">
+                    <h4>稀疏激活</h4>
+                    <p>虽然模型总参数量巨大，但每个 token 只激活 K 个专家，实际计算量约等于 K 个单专家前向传播之和。</p>
+                </div>
+                <div class="card">
+                    <h4>条件计算</h4>
+                    <p>网络根据输入内容动态选择计算路径，不同 token 走不同专家，实现"按需计算"。</p>
+                </div>
+                <div class="card">
+                    <h4>Top-K 路由</h4>
+                    <p>通过门控网络的 Softmax 分数进行排序，只保留前 K 个专家参与计算，其余专家完全不被激活。</p>
+                </div>
+                <div class="card">
+                    <h4>负载均衡</h4>
+                    <p>通过辅助损失函数或动态偏置，避免所有 token 都涌向少数"热门"专家，保证各专家负载均衡。</p>
+                </div>
+                <div class="card">
+                    <h4>容量因子</h4>
+                    <p>限制每个专家在单位批次内能处理的 token 数，超出容量的 token 会被溢出处理，平衡计算与内存。</p>
+                </div>
+                <div class="card">
+                    <h4>专家并行</h4>
+                    <p>将不同专家分布到不同计算设备上，通过 All-to-All 通信实现 token 路由与结果聚合。</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Section 4 -->
+        <section id="sec4">
+            <h2>4. 数学原理</h2>
+            <p>设输入为 <code>x ∈ R^d</code>，专家数量为 <code>N</code>，每个专家的输出为 <code>E_i(x)</code>，门控网络输出为 <code>g(x) ∈ R^N</code>。</p>
+
+            <h3>4.1 门控分数</h3>
+            <div class="formula">
+                g(x) = Softmax(W_g · x) ∈ R^N
+            </div>
+            <p>其中 <code>W_g ∈ R^(N×d)</code> 是门控网络的权重矩阵。</p>
+
+            <h3>4.2 Top-K 选择与归一化</h3>
+            <div class="formula">
+                G(x)_i = { g(x)_i,  if i ∈ TopK(g(x), K);<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;otherwise }
+            </div>
+            <p>通常会对选中的 K 个权重再次归一化，使得 <code>Σ w_i = 1</code>。</p>
+
+            <h3>4.3 MoE 层输出</h3>
+            <div class="formula">
+                y = Σ_{i ∈ TopK(g(x), K)} G(x)_i · E_i(x)
+            </div>
+            <p>只有被 Router 选中的专家才会参与最终输出的计算。</p>
+
+            <h3>4.4 负载均衡损失</h3>
+            <p>GShard 提出的辅助损失用于鼓励 token 均匀分布到各专家：</p>
+            <div class="formula">
+                L_load = N · Σ_{i=1}^{N} f_i · P_i
+            </div>
+            <p>其中 <code>f_i</code> 是实际分配给专家 i 的 token 比例，<code>P_i</code> 是门控网络对专家 i 的平均选择概率。该损失越小，说明实际负载越接近均匀分布。</p>
+        </section>
+
+        <!-- Section 5 -->
+        <section id="sec5">
+            <h2>5. PyTorch 逻辑实现</h2>
+            <p>下面给出一个简洁但完整的 MoE 层实现，包含路由、Top-K 选择、专家计算和加权聚合。</p>
+
+<pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">class</span> <span class="keyword">MoELayer</span>(nn.Module):
+    <span class="keyword">def</span> <span class="keyword">__init__</span>(self, hidden_dim, ffn_dim, num_experts, top_k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        <span class="comment"># 门控网络：将 hidden state 映射到专家得分</span>
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+
+        <span class="comment"># N 个独立专家，每个都是标准 FFN</span>
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, ffn_dim),
+                nn.GELU(),
+                nn.Linear(ffn_dim, hidden_dim),
+            ) <span class="keyword">for</span> _ <span class="keyword">in</span> range(num_experts)
+        ])
+
+    <span class="keyword">def</span> <span class="keyword">forward</span>(self, x):
+        <span class="comment"># x: [batch * seq_len, hidden_dim]</span>
+
+        <span class="comment"># 1. 计算路由分数</span>
+        gate_logits = self.gate(x)                <span class="comment"># [B, N]</span>
+        gate_probs = F.softmax(gate_logits, dim=-1) <span class="comment"># [B, N]</span>
+
+        <span class="comment"># 2. Top-K 选择</span>
+        topk_weights, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        <span class="comment"># 3. 专家计算 + 加权聚合</span>
+        output = torch.zeros_like(x)
+        <span class="keyword">for</span> k <span class="keyword">in</span> range(self.top_k):
+            expert_idx = topk_indices[:, k]        <span class="comment"># [B]</span>
+            weight = topk_weights[:, k].unsqueeze(-1)  <span class="comment"># [B, 1]</span>
+
+            <span class="keyword">for</span> e <span class="keyword">in</span> range(self.num_experts):
+                mask = (expert_idx == e)
+                <span class="keyword">if</span> mask.any():
+                    expert_input = x[mask]
+                    expert_out = self.experts[e](expert_input)
+                    output[mask] += weight[mask] * expert_out
+
+        <span class="keyword">return</span> output
+</code></pre>
+
+            <h3>5.1 负载均衡损失的实现</h3>
+<pre><code><span class="keyword">def</span> <span class="keyword">load_balance_loss</span>(router_probs, expert_indices, num_experts):
+    <span class="comment"># router_probs: [B, num_experts]</span>
+    <span class="comment"># expert_indices: [B, top_k]</span>
+    batch_size = router_probs.size(0)
+
+    <span class="comment"># 统计每个专家实际接收到的 token 数量</span>
+    freq = torch.zeros(batch_size, num_experts, device=router_probs.device)
+    freq.scatter_add_(
+        1,
+        expert_indices,
+        torch.ones_like(expert_indices, dtype=torch.float)
+    )
+
+    avg_prob = router_probs.mean(dim=0)      <span class="comment"># [N]</span>
+    avg_freq = freq.mean(dim=0)              <span class="comment"># [N]</span>
+
+    <span class="keyword">return</span> num_experts * torch.sum(avg_freq * avg_prob)
+</code></pre>
+
+            <h3>5.2 容量裁剪</h3>
+<pre><code><span class="keyword">def</span> <span class="keyword">apply_capacity</span>(expert_indices, capacity_factor, num_experts):
+    batch_size = expert_indices.size(0)
+    capacity = int((batch_size / num_experts) * capacity_factor)
+
+    <span class="comment"># 对每个专家，只保留前 capacity 个 token</span>
+    counts = torch.zeros(num_experts, dtype=torch.long)
+    mask = torch.zeros_like(expert_indices, dtype=torch.bool)
+
+    <span class="keyword">for</span> i <span class="keyword">in</span> range(batch_size):
+        <span class="keyword">for</span> k <span class="keyword">in</span> range(expert_indices.size(1)):
+            e = expert_indices[i, k].item()
+            <span class="keyword">if</span> counts[e] &lt; capacity:
+                mask[i, k] = True
+                counts[e] += 1
+
+    <span class="keyword">return</span> mask  <span class="comment"># 超出容量的位置为 False</span>
+</code></pre>
+        </section>
+
+        <!-- Section 6 -->
+        <section id="sec6">
+            <h2>6. 专家并行与通信</h2>
+            <p>当专家数量很多时，单个设备无法容纳所有专家参数，因此需要 <strong>专家并行（Expert Parallelism, EP）</strong>。不同专家被放置在不同设备上，每个 token 根据 Router 结果通过 All-to-All 通信发送到对应设备。</p>
+
+            <figure class="figure">
+                <svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <marker id="arr2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+                            <path d="M1 1 L7 4 L1 7 Z" fill="#6e6e73"/>
+                        </marker>
+                    </defs>
+
+                    <!-- Device 1 -->
+                    <rect x="60" y="40" width="180" height="200" rx="14" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="150" y="70" text-anchor="middle" font-size="15" font-weight="600" fill="#1d1d1f">Device 1</text>
+                    <rect x="90" y="90" width="120" height="50" rx="8" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="1.5"/>
+                    <text x="150" y="120" text-anchor="middle" font-size="14" fill="#1a1759">Expert 0,1</text>
+                    <rect x="90" y="160" width="120" height="50" rx="8" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="1.5"/>
+                    <text x="150" y="190" text-anchor="middle" font-size="14" fill="#1a1759">Expert 2,3</text>
+
+                    <!-- Device 2 -->
+                    <rect x="290" y="40" width="180" height="200" rx="14" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="380" y="70" text-anchor="middle" font-size="15" font-weight="600" fill="#1d1d1f">Device 2</text>
+                    <rect x="320" y="90" width="120" height="50" rx="8" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="1.5"/>
+                    <text x="380" y="120" text-anchor="middle" font-size="14" fill="#1a1759">Expert 4,5</text>
+                    <rect x="320" y="160" width="120" height="50" rx="8" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="1.5"/>
+                    <text x="380" y="190" text-anchor="middle" font-size="14" fill="#1a1759">Expert 6,7</text>
+
+                    <!-- Device 3 -->
+                    <rect x="520" y="40" width="180" height="200" rx="14" fill="#f5f5f7" stroke="rgba(0,0,0,0.1)" stroke-width="1.5"/>
+                    <text x="610" y="70" text-anchor="middle" font-size="15" font-weight="600" fill="#1d1d1f">Device 3</text>
+                    <rect x="550" y="90" width="120" height="50" rx="8" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="1.5"/>
+                    <text x="610" y="120" text-anchor="middle" font-size="14" fill="#1a1759">Expert 8,9</text>
+                    <rect x="550" y="160" width="120" height="50" rx="8" fill="#f2f7ff" stroke="#4b3fe3" stroke-width="1.5"/>
+                    <text x="610" y="190" text-anchor="middle" font-size="14" fill="#1a1759">Expert 10,11</text>
+
+                    <!-- Arrows -->
+                    <path d="M150 250 L150 270 L610 270 L610 250" stroke="#6e6e73" stroke-width="1.5" fill="none" marker-end="url(#arr2)" marker-start="url(#arr2)" stroke-linecap="round" stroke-dasharray="5 5"/>
+                    <text x="380" y="262" text-anchor="middle" font-size="12" fill="#6e6e73">All-to-All 通信：token 分发与结果汇总</text>
+                </svg>
+                <figcaption class="figure-caption">图 2：专家并行示意。12 个专家分布到 3 个设备，每个 token 通过 All-to-All 路由到目标设备计算后再返回。</figcaption>
+            </figure>
+
+            <p>专家并行的通信流程分为两个阶段：</p>
+            <ol>
+                <li><strong>Dispatch（分发）：</strong>每个设备根据本地 Router 结果，把 token 发送到拥有对应专家的设备；</li>
+                <li><strong>Combine（合并）：</strong>各设备完成专家计算后，把结果通过 All-to-All 发回原始设备，按权重聚合。</li>
+            </ol>
+
+            <div class="highlight">
+                <p><strong>关键观察：</strong>MoE 的训练/推理吞吐不仅取决于 FLOPs，更取决于 All-to-All 通信延迟。EP 分组大小、负载均衡、容量因子和通信压缩策略是工程优化的核心。</p>
+            </div>
+        </section>
+
+        <!-- Section 7 -->
+        <section id="sec7">
+            <h2>7. 应用场景与挑战</h2>
+
+            <h3>7.1 典型应用场景</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>场景</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>大语言模型</td>
+                        <td>DeepSeek-V2/V3、Mixtral 8x7B、GShard 等使用 MoE 扩展模型容量</td>
+                    </tr>
+                    <tr>
+                        <td>多任务学习</td>
+                        <td>不同专家学习不同任务或领域的特征表示</td>
+                    </tr>
+                    <tr>
+                        <td>多模态模型</td>
+                        <td>为图像、文本、音频等不同模态分配不同专家</td>
+                    </tr>
+                    <tr>
+                        <td>推荐系统</td>
+                        <td>不同专家学习不同用户群体或商品类别的模式</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>7.2 主要挑战</h3>
+            <ul>
+                <li><strong>训练不稳定性：</strong>Router 容易出现收敛困难、专家坍缩（所有 token 偏向少数专家）等问题；</li>
+                <li><strong>负载不均衡：</strong>某些专家可能过载，导致容量溢出和性能下降；</li>
+                <li><strong>通信开销：</strong>专家并行引入大量 All-to-All 通信，对网络带宽和拓扑敏感；</li>
+                <li><strong>显存碎片：</strong>不同批次分配到各专家的 token 数动态变化，容易导致显存使用不均衡；</li>
+                <li><strong>推理调度复杂：</strong>动态路由增加了服务化部署中的 batching 和调度难度。</li>
+            </ul>
+        </section>
+
+        <!-- Section 8 -->
+        <section id="sec8">
+            <h2>8. 总结</h2>
+            <p>MoE 混合专家网络通过<strong>稀疏激活</strong>和<strong>条件计算</strong>，在不显著增加单次推理计算量的前提下，大幅扩展了模型容量。其核心组件包括：</p>
+            <ul>
+                <li>多个独立的专家网络（Experts）</li>
+                <li>决定路由的门控网络（Router）</li>
+                <li>只激活 Top-K 个专家的选择机制</li>
+            </ul>
+            <p>工程实践中，负载均衡损失、容量因子和专家并行是 MoE 能够高效训练和部署的三大关键。在 vLLM-Ascend 等 NPU 场景中，还需要特别关注 All-to-All 通信优化、NPU 内存碎片化以及动态路由带来的调度开销。</p>
+
+            <div class="highlight">
+                <p><strong>一句话概括：</strong>MoE 用"多个专家 + 动态路由"替代"单一稠密网络"，让模型在参数更多、能力更强的同时，保持每次推理的计算成本基本可控。</p>
+            </div>
+        </section>
+
+        <footer>
+            <p>MoE 混合专家网络技术报告 &nbsp;|&nbsp; 生成于 2026-08-26</p>
+        </footer>
+    </div>
+</body>
+</html>
