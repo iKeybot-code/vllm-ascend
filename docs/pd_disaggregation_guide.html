@@ -1,0 +1,1416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM Ascend PD 分离特性全流程解析（重排版）</title>
+<style>
+  :root {
+    --surface: #F7F7F8;
+    --surface-muted: #EFEFF2;
+    --surface-card: #FFFFFF;
+    --text: #171717;
+    --text-muted: #52525B;
+    --border: rgba(23, 23, 23, 0.12);
+    --brand: #4B3FE3;
+    --brand-soft: #F2F7FF;
+    --brand-soft-strong: #E5EAFF;
+    --brand-text: #1A1759;
+    --brand-on: #FFFFFF;
+    --accent: #27D2BF;
+    --accent-soft: #EAFBF8;
+    --accent-text: #0F766E;
+    --success: #1DC981;
+    --warning: #EFAA17;
+    --danger: #E8463A;
+    --danger-soft: #FDECEA;
+    --radius: 8px;
+    --radius-card: 12px;
+    --radius-full: 999px;
+    --spacer-4: 4px;
+    --spacer-8: 8px;
+    --spacer-12: 12px;
+    --spacer-16: 16px;
+    --spacer-20: 20px;
+    --spacer-24: 24px;
+    --spacer-32: 32px;
+    --font-sans: "SF Pro Text", "PingFang SC", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #0F0F11;
+      --surface-muted: #1A1A1F;
+      --surface-card: #171717;
+      --text: #E5E5E5;
+      --text-muted: #A1A1AA;
+      --border: rgba(229, 229, 229, 0.12);
+      --brand: #6054F1;
+      --brand-soft: #1A1759;
+      --brand-soft-strong: #2A2476;
+      --brand-text: #CFD8FF;
+      --accent-soft: #123F3C;
+      --accent-text: #CCFBF1;
+      --danger-soft: #3A1B18;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.65;
+    letter-spacing: 0;
+  }
+
+  /* Layout: sticky TOC + content */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 32px;
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 24px;
+  }
+
+  @media (max-width: 960px) {
+    .layout { grid-template-columns: 1fr; padding: 16px; gap: 16px; }
+    .toc-side { position: static !important; max-height: none !important; }
+  }
+
+  /* Sticky TOC */
+  .toc-side {
+    position: sticky;
+    top: 24px;
+    align-self: start;
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    padding: 16px;
+    background: var(--surface-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    font-size: 13px;
+  }
+  .toc-side h4 {
+    margin: 0 0 12px 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .toc-side .part { margin: 12px 0 4px 0; font-weight: 600; color: var(--brand-text); font-size: 12px; }
+  .toc-side ol { margin: 0; padding-left: 18px; }
+  .toc-side li { margin: 3px 0; }
+  .toc-side a { color: var(--text-muted); text-decoration: none; }
+  .toc-side a:hover { color: var(--brand); }
+
+  /* Content area */
+  .content { min-width: 0; }
+
+  /* Hero */
+  .hero {
+    background: linear-gradient(135deg, var(--brand-soft) 0%, var(--accent-soft) 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 28px 32px;
+    margin-bottom: 32px;
+  }
+  .hero h1 {
+    font-size: 26px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    color: var(--text);
+    letter-spacing: -0.2px;
+  }
+  .hero .subtitle {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .hero .tags { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .hero .tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: var(--radius-full);
+    background: var(--surface-card);
+    border: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  /* Part header */
+  .part-banner {
+    margin: 40px 0 20px 0;
+    padding: 16px 20px;
+    background: var(--surface-card);
+    border-left: 4px solid var(--brand);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .part-banner .part-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--brand);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .part-banner h2 {
+    margin: 4px 0 0 0;
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .part-banner .part-summary {
+    margin: 6px 0 0 0;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
+  /* Subsection */
+  h3.section-title {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 28px 0 12px 0;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  h3.section-title::before {
+    content: "";
+    display: inline-block;
+    width: 3px;
+    height: 16px;
+    background: var(--brand);
+    border-radius: 2px;
+  }
+
+  h4.sub-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 20px 0 8px 0;
+    color: var(--text);
+  }
+
+  p { margin: 8px 0; }
+
+  /* Card */
+  .card {
+    background: var(--surface-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 18px 20px;
+    margin: 12px 0;
+  }
+  .card-brand {
+    border-color: var(--brand);
+    background: linear-gradient(180deg, var(--brand-soft) 0%, var(--surface-card) 100%);
+  }
+  .card-accent {
+    border-color: var(--accent);
+    background: linear-gradient(180deg, var(--accent-soft) 0%, var(--surface-card) 100%);
+  }
+  .card-danger {
+    border-color: var(--danger);
+    background: linear-gradient(180deg, var(--danger-soft) 0%, var(--surface-card) 100%);
+  }
+
+  /* Code */
+  pre {
+    background: var(--surface-muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    overflow-x: auto;
+    font-size: 12.5px;
+    line-height: 1.55;
+    margin: 8px 0;
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+  p code, li code, td code { 
+    background: var(--surface-muted); 
+    padding: 1px 6px; 
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--brand-text);
+  }
+  pre code { background: none; padding: 0; color: var(--text); }
+
+  /* File ref */
+  .file-ref {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 4px 0 8px 0;
+  }
+  .file-ref a {
+    color: var(--brand);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--brand);
+  }
+  .file-ref a:hover { opacity: 0.8; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 13px;
+    background: var(--surface-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  th, td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--surface-muted);
+    font-weight: 600;
+    color: var(--text);
+    font-size: 12px;
+  }
+  tr:last-child td { border-bottom: none; }
+  td a { color: var(--brand); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+
+  /* SVG container */
+  .svg-container {
+    background: var(--surface-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 16px;
+    margin: 12px 0;
+    overflow-x: auto;
+  }
+  .svg-container svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .svg-caption {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+    margin-top: 8px;
+    font-style: italic;
+  }
+
+  /* Phase number badge */
+  .phase-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--brand);
+    color: var(--brand-on);
+    font-weight: 600;
+    font-size: 14px;
+    margin-right: 8px;
+  }
+
+  ul, ol { padding-left: 20px; }
+  li { margin: 4px 0; }
+
+  /* Grid layout for cards */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 760px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+
+  /* Callout */
+  .callout {
+    background: var(--surface-muted);
+    border-left: 3px solid var(--brand);
+    padding: 10px 14px;
+    border-radius: 0 var(--radius) var(--radius) 0;
+    margin: 10px 0;
+    font-size: 13px;
+  }
+  .callout-accent { border-left-color: var(--accent); }
+  .callout-danger { border-left-color: var(--danger); }
+
+  /* Footer */
+  footer {
+    margin-top: 48px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 12px;
+    text-align: center;
+  }
+
+  /* Inline term definition */
+  .term-grid {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 6px 12px;
+    font-size: 13px;
+  }
+  .term-grid dt {
+    font-weight: 600;
+    color: var(--brand-text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .term-grid dd { margin: 0; color: var(--text); }
+
+  /* Print friendly */
+  @media print {
+    .toc-side { display: none; }
+    .layout { display: block; }
+    .card, pre { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- ==================== Sticky TOC ==================== -->
+  <aside class="toc-side">
+    <h4>导航目录</h4>
+    <div class="part">第一部分 · 概念基础</div>
+    <ol>
+      <li><a href="#what-is-pd">什么是 PD 分离</a></li>
+      <li><a href="#why-pd">为什么需要 PD 分离</a></li>
+      <li><a href="#terms">核心术语</a></li>
+      <li><a href="#pull-vs-push">两种工作模式</a></li>
+    </ol>
+
+    <div class="part">第二部分 · 系统架构</div>
+    <ol>
+      <li><a href="#arch-diagram">整体架构图</a></li>
+      <li><a href="#components">组件角色</a></li>
+    </ol>
+
+    <div class="part">第三部分 · 请求生命周期</div>
+    <ol>
+      <li><a href="#flow-overview">完整流程总览</a></li>
+      <li><a href="#phase-1">阶段 1：HTTP 接入</a></li>
+      <li><a href="#phase-2">阶段 2：调度选 P</a></li>
+      <li><a href="#phase-3">阶段 3：P 节点调度</a></li>
+      <li><a href="#phase-4">阶段 4：P 节点计算</a></li>
+      <li><a href="#phase-5">阶段 5：KV 延迟释放</a></li>
+      <li><a href="#phase-6">阶段 6：选 D 转发</a></li>
+      <li><a href="#phase-7">阶段 7：D 预分配</a></li>
+      <li><a href="#phase-8">阶段 8：D 异步拉 KV</a></li>
+      <li><a href="#phase-9">阶段 9：P 发送侧</a></li>
+      <li><a href="#phase-10">阶段 10：D 解码响应</a></li>
+    </ol>
+
+    <div class="part">第四部分 · 核心机制</div>
+    <ol>
+      <li><a href="#async-queue">异步队列机制</a></li>
+      <li><a href="#kv-mechanism">KV 传输机制</a></li>
+      <li><a href="#error-retry">错误处理与重试</a></li>
+    </ol>
+
+    <div class="part">第五部分 · 代码索引</div>
+    <ol>
+      <li><a href="#key-funcs">关键函数索引</a></li>
+    </ol>
+  </aside>
+
+  <!-- ==================== Content ==================== -->
+  <main class="content">
+
+    <!-- Hero -->
+    <div class="hero">
+      <h1>vLLM Ascend PD 分离特性全流程解析</h1>
+      <p class="subtitle">Prefill-Decode Disaggregation · MooncakeConnector (Pull 模式) · 代码版本 2026-08-17</p>
+      <div class="tags">
+        <span class="tag">vLLM Ascend Plugin</span>
+        <span class="tag">KV Cache Disaggregation</span>
+        <span class="tag">Mooncake TransferEngine</span>
+        <span class="tag">RDMA / P2P</span>
+        <span class="tag">NPU 910B/C</span>
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- 第一部分 · 概念基础                                            -->
+    <!-- ============================================================ -->
+    <div class="part-banner">
+      <div class="part-label">PART 1</div>
+      <h2>概念基础</h2>
+      <p class="part-summary">先理解 PD 分离解决什么问题、涉及哪些核心概念，再进入架构与流程细节。</p>
+    </div>
+
+    <h3 class="section-title" id="what-is-pd">1.1 什么是 PD 分离</h3>
+    <div class="card">
+      <p>PD 分离（Prefill-Decode Disaggregation）把一次推理请求的生命周期切成两段，由不同硬件实例承担：</p>
+      <ul>
+        <li><strong>P 节点（Prefiller）</strong>：专门处理 prefill 阶段，对完整 prompt 做并行计算，生成 KV Cache，<strong>只输出 1 个 token</strong>。</li>
+        <li><strong>D 节点（Decoder）</strong>：专门处理 decode 阶段，从 P 节点拉取 KV Cache 后逐 token 自回归解码。</li>
+      </ul>
+      <p>两节点之间通过 Mooncake TransferEngine（RDMA/P2P）传递 KV Cache，避免重算。</p>
+    </div>
+
+    <h3 class="section-title" id="why-pd">1.2 为什么需要 PD 分离</h3>
+    <div class="card card-accent">
+      <p>传统连续批处理（CB）中 prefill 与 decode 混跑，存在三类痛点：</p>
+      <ul>
+        <li><strong>计算资源竞争</strong>：prefill 是计算密集型（长 prompt 并行），decode 是访存密集型（短输入），同一 GPU 同时优化两者困难。</li>
+        <li><strong>延迟互相干扰</strong>：长 prefill 会阻塞 decode，导致已生成 token 的 TPOT 抖动。</li>
+        <li><strong>并行策略冲突</strong>：prefill 偏好 TP/PP，decode 偏好 DP，单实例难以兼顾。</li>
+      </ul>
+      <p>PD 分离让 P / D 节点各自选择最优并行策略与实例数量，分别优化 <strong>TTFT</strong> 与 <strong>TPOT</strong>；KV Cache 通过高速互联在 P/D 间传输，消除重算开销。</p>
+    </div>
+
+    <h3 class="section-title" id="terms">1.3 核心术语</h3>
+    <div class="card">
+      <dl class="term-grid">
+        <dt>P / D 节点</dt><dd>Prefiller / Decoder 实例，对应 <code>kv_role = kv_producer / kv_consumer</code></dd>
+        <dt>Proxy Server</dt><dd>PD 分离对外入口，做 HTTP 接入、P/D 调度、流式转发、重算重试</dd>
+        <dt>MooncakeConnector</dt><dd>Pull 模式 KV 传输 Connector（D 主动从 P 拉 KV）</dd>
+        <dt>MooncakeLayerwiseConnector</dt><dd>Push 模式 KV 传输 Connector（P 在 forward 中逐层 push）</dd>
+        <dt>KVCacheSendingThread</dt><dd>P 节点侧线程，作为 ZMQ 元数据服务器响应 D 的握手</dd>
+        <dt>KVCacheRecvingThread</dt><dd>D 节点侧线程，三级队列 + 线程池，异步拉取 KV</dd>
+        <dt>MooncakeAgentMetadata</dt><dd>P 节点 KV 内存布局描述，含 engine_id、端口、层映射、块元数据</dd>
+        <dt>pcp / dcp</dt><dd>Prefill CP / Decode CP 大小（context parallel）</dd>
+        <dt>WAITING_FOR_REMOTE_KVS</dt><dd>D 节点请求状态：已预分配块，阻塞等待 KV 拉取</dd>
+        <dt>FINISHED_LENGTH_CAPPED</dt><dd>P 节点请求完成状态：达到 max_tokens=1，触发 KV 延迟释放</dd>
+      </dl>
+    </div>
+
+    <h3 class="section-title" id="pull-vs-push">1.4 两种工作模式：Pull vs Push</h3>
+    <table>
+      <tr><th>Connector</th><th>方向</th><th>触发方</th><th>说明</th></tr>
+      <tr>
+        <td><code>MooncakeConnector</code></td>
+        <td>D → P</td>
+        <td>D 节点主动</td>
+        <td>默认模式。D 节点在 prefill 前异步发起 <code>transfer</code>，P 节点 ZMQ 返回元数据后 RDMA 拉取</td>
+      </tr>
+      <tr>
+        <td><code>MooncakeLayerwiseConnector</code></td>
+        <td>P → D</td>
+        <td>P 节点主动</td>
+        <td>P 节点在 forward 每层完成后 push KV 到 D，可与计算重叠</td>
+      </tr>
+    </table>
+    <p class="callout">本文档以默认的 <strong>Pull 模式</strong> 为主线展开。Push 模式的协议与 Pull 镜像对称，可对照阅读。</p>
+
+    <!-- ============================================================ -->
+    <!-- 第二部分 · 系统架构                                            -->
+    <!-- ============================================================ -->
+    <div class="part-banner">
+      <div class="part-label">PART 2</div>
+      <h2>系统架构</h2>
+      <p class="part-summary">把概念落地为组件拓扑：客户端、代理、P/D 节点、Mooncake 引擎四者之间的关系。</p>
+    </div>
+
+    <h3 class="section-title" id="arch-diagram">2.1 整体架构图</h3>
+    <div class="svg-container">
+      <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="archArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#52525B"/>
+          </marker>
+          <marker id="archArrowBrand" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#4B3FE3"/>
+          </marker>
+        </defs>
+
+        <!-- Client -->
+        <rect x="30" y="180" width="120" height="60" rx="30" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="90" y="207" text-anchor="middle" font-size="14" font-weight="500" fill="#171717" font-family="sans-serif">Client</text>
+        <text x="90" y="223" text-anchor="middle" font-size="12" fill="#52525B" font-family="sans-serif">HTTP 请求</text>
+
+        <!-- Proxy -->
+        <rect x="230" y="140" width="160" height="140" rx="12" fill="#F2F7FF" stroke="#4B3FE3" stroke-width="1.5"/>
+        <text x="310" y="170" text-anchor="middle" font-size="14" font-weight="600" fill="#1A1759" font-family="sans-serif">Proxy Server</text>
+        <text x="310" y="190" text-anchor="middle" font-size="12" fill="#4B3FE3" font-family="sans-serif">SharedProxyScheduler</text>
+        <line x1="250" y1="200" x2="370" y2="200" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="310" y="215" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· 懒删除小顶堆</text>
+        <text x="310" y="230" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· P/D 负载均衡</text>
+        <text x="310" y="245" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· 流式转发</text>
+        <text x="310" y="260" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· 重算重试</text>
+
+        <!-- P Node -->
+        <rect x="470" y="40" width="200" height="150" rx="12" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="570" y="70" text-anchor="middle" font-size="14" font-weight="600" fill="#171717" font-family="sans-serif">P 节点 (Prefiller)</text>
+        <text x="570" y="88" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">kv_role = kv_producer</text>
+        <line x1="480" y1="98" x2="660" y2="98" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="570" y="115" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· EngineCore / Scheduler</text>
+        <text x="570" y="130" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· NPUModelRunner (forward)</text>
+        <text x="570" y="145" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· KVCacheSendingThread</text>
+        <text x="570" y="160" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· MooncakeAgentMetadata</text>
+
+        <!-- D Node -->
+        <rect x="470" y="230" width="200" height="150" rx="12" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="570" y="260" text-anchor="middle" font-size="14" font-weight="600" fill="#171717" font-family="sans-serif">D 节点 (Decoder)</text>
+        <text x="570" y="278" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">kv_role = kv_consumer</text>
+        <line x1="480" y1="288" x2="660" y2="288" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="570" y="305" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· EngineCore / Scheduler</text>
+        <text x="570" y="320" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· NPUModelRunner (decode)</text>
+        <text x="570" y="335" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· KVCacheRecvingThread</text>
+        <text x="570" y="350" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· ThreadPoolExecutor</text>
+
+        <!-- Mooncake TransferEngine -->
+        <rect x="730" y="130" width="160" height="120" rx="12" fill="#EAFBF8" stroke="#27D2BF" stroke-width="1.5"/>
+        <text x="810" y="160" text-anchor="middle" font-size="13" font-weight="600" fill="#0F766E" font-family="sans-serif">Mooncake</text>
+        <text x="810" y="178" text-anchor="middle" font-size="13" font-weight="600" fill="#0F766E" font-family="sans-serif">TransferEngine</text>
+        <line x1="740" y1="188" x2="880" y2="188" stroke="rgba(23,23,23,0.12)" stroke-width="1"/>
+        <text x="810" y="205" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· RDMA / P2P</text>
+        <text x="810" y="220" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· register_buffer</text>
+        <text x="810" y="235" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">· transfer (src→dst)</text>
+
+        <!-- Arrows -->
+        <path d="M150 200 H225" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#archArrowBrand)"/>
+        <text x="187" y="194" text-anchor="middle" font-size="11" fill="#4B3FE3" font-family="sans-serif">① 请求</text>
+
+        <path d="M390 175 Q430 175 465 110" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#archArrowBrand)"/>
+        <text x="440" y="135" text-anchor="middle" font-size="11" fill="#4B3FE3" font-family="sans-serif">② Prefill</text>
+
+        <path d="M465 130 Q430 130 390 175" fill="none" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#archArrow)"/>
+        <text x="430" y="165" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">③ kv_params</text>
+
+        <path d="M390 240 Q430 240 465 290" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#archArrowBrand)"/>
+        <text x="440" y="280" text-anchor="middle" font-size="11" fill="#4B3FE3" font-family="sans-serif">④ Decode</text>
+
+        <path d="M570 230 Q700 180 570 190" fill="none" stroke="#27D2BF" stroke-width="2" marker-end="url(#archArrow)"/>
+        <text x="700" y="200" text-anchor="middle" font-size="11" fill="#0F766E" font-family="sans-serif">⑤ Pull KV (RDMA)</text>
+
+        <path d="M465 290 Q430 290 390 245" fill="none" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#archArrow)"/>
+        <text x="430" y="275" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">⑥ 流式响应</text>
+
+        <path d="M225 220 H150" fill="none" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#archArrow)"/>
+        <text x="187" y="238" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">⑦ 返回</text>
+
+        <path d="M670 110 Q720 120 725 145" fill="none" stroke="#52525B" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#archArrow)"/>
+        <path d="M670 290 Q720 260 725 235" fill="none" stroke="#52525B" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#archArrow)"/>
+
+        <!-- Legend -->
+        <rect x="30" y="410" width="860" height="40" rx="8" fill="#F7F7F8" stroke="rgba(23,23,23,0.12)"/>
+        <rect x="50" y="422" width="16" height="3" fill="#4B3FE3"/>
+        <text x="72" y="428" font-size="11" fill="#52525B" font-family="sans-serif">主请求路径</text>
+        <rect x="160" y="422" width="16" height="3" fill="#27D2BF"/>
+        <text x="182" y="428" font-size="11" fill="#52525B" font-family="sans-serif">KV Cache 传输 (RDMA)</text>
+        <line x1="320" y1="423" x2="336" y2="423" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="342" y="428" font-size="11" fill="#52525B" font-family="sans-serif">响应/返回</text>
+        <line x1="430" y1="423" x2="446" y2="423" stroke="#52525B" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="452" y="428" font-size="11" fill="#52525B" font-family="sans-serif">内存注册</text>
+      </svg>
+      <div class="svg-caption">图 2-1：PD 分离系统架构与请求主路径</div>
+    </div>
+
+    <h3 class="section-title" id="components">2.2 组件角色</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键文件</th></tr>
+      <tr>
+        <td><strong>Client</strong></td>
+        <td>OpenAI 风格 HTTP 请求发起方</td>
+        <td>—</td>
+      </tr>
+      <tr>
+        <td><strong>Proxy Server</strong></td>
+        <td>请求接入、P/D 选址、流式转发、重算重试、KV 释放</td>
+        <td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py">load_balance_proxy_server_example.py</a></td>
+      </tr>
+      <tr>
+        <td><strong>P 节点 EngineCore</strong></td>
+        <td>请求调度、KV 块分配、MooncakeConnectorScheduler</td>
+        <td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py">mooncake_connector.py</a></td>
+      </tr>
+      <tr>
+        <td><strong>P 节点 Worker / ModelRunner</strong></td>
+        <td>模型 forward、KV 生成、采样 1 个 token</td>
+        <td><a href="file:///workspace/vllm_ascend/worker/worker.py">worker.py</a> / <a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py">model_runner_v1.py</a></td>
+      </tr>
+      <tr>
+        <td><strong>D 节点 EngineCore</strong></td>
+        <td>请求预分配、状态管理（WAITING_FOR_REMOTE_KVS）</td>
+        <td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py">mooncake_connector.py</a></td>
+      </tr>
+      <tr>
+        <td><strong>D 节点 Worker / ModelRunner</strong></td>
+        <td>异步 KV 拉取触发、decode forward、token 生成</td>
+        <td><a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py">model_runner_v1.py</a></td>
+      </tr>
+      <tr>
+        <td><strong>Mooncake TransferEngine</strong></td>
+        <td>RDMA / P2P KV 内存拷贝、buffer 注册</td>
+        <td>外部依赖</td>
+      </tr>
+    </table>
+
+    <!-- ============================================================ -->
+    <!-- 第三部分 · 请求生命周期                                         -->
+    <!-- ============================================================ -->
+    <div class="part-banner">
+      <div class="part-label">PART 3</div>
+      <h2>请求生命周期</h2>
+      <p class="part-summary">从一个 HTTP 请求到响应返回的 10 个阶段，按时间顺序逐段拆解。每段标注入口函数、关键代码、所属文件。</p>
+    </div>
+
+    <h3 class="section-title" id="flow-overview">3.1 完整流程总览</h3>
+    <div class="svg-container">
+      <svg viewBox="0 0 920 920" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="flowArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#52525B"/>
+          </marker>
+          <marker id="flowArrowBrand" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#4B3FE3"/>
+          </marker>
+          <marker id="flowArrowAccent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#27D2BF"/>
+          </marker>
+        </defs>
+
+        <!-- Phase 1 -->
+        <rect x="30" y="20" width="160" height="50" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="110" y="42" text-anchor="middle" font-size="13" font-weight="500" fill="#171717" font-family="sans-serif">Client</text>
+        <text x="110" y="58" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">POST /v1/completions</text>
+
+        <rect x="250" y="20" width="160" height="50" rx="8" fill="#F2F7FF" stroke="#4B3FE3" stroke-width="1.5"/>
+        <text x="330" y="42" text-anchor="middle" font-size="13" font-weight="500" fill="#1A1759" font-family="sans-serif">Proxy</text>
+        <text x="330" y="58" text-anchor="middle" font-size="11" fill="#4B3FE3" font-family="sans-serif">handle_completions_impl</text>
+
+        <path d="M190 45 H245" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#flowArrowBrand)"/>
+        <text x="217" y="38" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">① HTTP</text>
+
+        <!-- Phase 2 -->
+        <rect x="250" y="100" width="160" height="80" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="330" y="122" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">SharedProxyScheduler</text>
+        <text x="330" y="138" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">begin_request(score)</text>
+        <text x="330" y="152" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">_pop_valid (小顶堆)</text>
+        <text x="330" y="166" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">build_prefill_request</text>
+
+        <path d="M330 70 V95" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#flowArrow)"/>
+
+        <!-- Phase 3 -->
+        <rect x="500" y="100" width="200" height="80" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="600" y="122" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">P: EngineCore</text>
+        <text x="600" y="138" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">MooncakeConnectorScheduler</text>
+        <text x="600" y="152" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">update_state_after_alloc</text>
+        <text x="600" y="166" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">build_connector_meta</text>
+
+        <path d="M410 130 H495" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#flowArrowBrand)"/>
+        <text x="452" y="124" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">② Prefill req</text>
+
+        <!-- Phase 4 -->
+        <rect x="500" y="210" width="200" height="80" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="600" y="232" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">P: Worker / ModelRunner</text>
+        <text x="600" y="248" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">NPUWorker.execute_model</text>
+        <text x="600" y="262" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">_model_forward (NPU)</text>
+        <text x="600" y="276" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">sample_tokens → 1 token</text>
+
+        <path d="M600 180 V205" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#flowArrow)"/>
+
+        <!-- Phase 5 -->
+        <rect x="500" y="320" width="200" height="80" rx="8" fill="#F2F7FF" stroke="#4B3FE3" stroke-width="1.5"/>
+        <text x="600" y="342" text-anchor="middle" font-size="12" font-weight="500" fill="#1A1759" font-family="sans-serif">P: request_finished</text>
+        <text x="600" y="358" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">FINISHED_LENGTH_CAPPED</text>
+        <text x="600" y="372" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">do_remote_decode=True</text>
+        <text x="600" y="386" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">延迟释放 KV → return params</text>
+
+        <path d="M600 290 V315" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#flowArrow)"/>
+
+        <!-- Phase 6 -->
+        <rect x="250" y="320" width="200" height="80" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="350" y="342" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">Proxy: 选 D 节点</text>
+        <text x="350" y="358" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">schedule("pick_decoder")</text>
+        <text x="350" y="372" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">合并 kv_transfer_params</text>
+        <text x="350" y="386" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">转发 decode 请求</text>
+
+        <path d="M495 360 H455" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#flowArrowBrand)"/>
+        <text x="475" y="354" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">③ params</text>
+
+        <!-- Phase 7 -->
+        <rect x="30" y="430" width="200" height="80" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="130" y="452" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">D: EngineCore 预分配</text>
+        <text x="130" y="468" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">get_num_new_matched_tokens</text>
+        <text x="130" y="482" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">WAITING_FOR_REMOTE_KVS</text>
+        <text x="130" y="496" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">预分配 KV 块</text>
+
+        <path d="M250 380 Q190 400 130 425" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#flowArrowBrand)"/>
+        <text x="180" y="410" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">④ Decode req</text>
+
+        <!-- Phase 8 -->
+        <rect x="30" y="540" width="400" height="100" rx="8" fill="#EAFBF8" stroke="#27D2BF" stroke-width="1.5"/>
+        <text x="230" y="565" text-anchor="middle" font-size="13" font-weight="600" fill="#0F766E" font-family="sans-serif">D: KVCacheRecvingThread 异步拉取</text>
+        <text x="230" y="585" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">request_queue → _submit_request → peer_request_queues</text>
+        <text x="230" y="600" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">ThreadPoolExecutor._handle_peer_requests</text>
+        <text x="230" y="615" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">_transfer_kv_cache_all_groups (RDMA)</text>
+        <text x="230" y="630" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">task_tracker.update_done_task_count</text>
+
+        <path d="M130 510 V535" fill="none" stroke="#27D2BF" stroke-width="2" marker-end="url(#flowArrowAccent)"/>
+        <text x="148" y="525" text-anchor="middle" font-size="10" fill="#0F766E" font-family="sans-serif">⑤ trigger</text>
+
+        <!-- Phase 9 -->
+        <rect x="500" y="430" width="200" height="100" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="600" y="452" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">P: KVCacheSendingThread</text>
+        <text x="600" y="468" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">ZMQ ROUTER (side_channel)</text>
+        <text x="600" y="482" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">GET_META_MSG → metadata</text>
+        <text x="600" y="496" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">DONE_RECVING_MSG → 释放</text>
+        <text x="600" y="510" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">MooncakeAgentMetadata</text>
+
+        <path d="M430 580 Q500 530 495 480" fill="none" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#flowArrow)"/>
+        <text x="475" y="535" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">⑥ 握手/释放</text>
+
+        <!-- Phase 10 -->
+        <rect x="30" y="670" width="400" height="80" rx="8" fill="#F2F7FF" stroke="#4B3FE3" stroke-width="1.5"/>
+        <text x="230" y="692" text-anchor="middle" font-size="12" font-weight="500" fill="#1A1759" font-family="sans-serif">D: ModelRunner decode forward</text>
+        <text x="230" y="708" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">KV 拉取完成 → 状态变可调度</text>
+        <text x="230" y="722" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">逐 token 解码</text>
+        <text x="230" y="736" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif">流式返回 → Proxy → Client</text>
+
+        <path d="M230 640 V665" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#flowArrowBrand)"/>
+        <text x="248" y="655" text-anchor="middle" font-size="10" fill="#4B3FE3" font-family="sans-serif">⑦ done</text>
+
+        <!-- Return arrow -->
+        <path d="M30 710 Q10 380 30 45" fill="none" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#flowArrow)"/>
+        <text x="14" y="380" text-anchor="middle" font-size="10" fill="#52525B" font-family="sans-serif" transform="rotate(-90 14 380)">⑧ 流式响应返回 Client</text>
+
+        <!-- Phase labels -->
+        <text x="850" y="55" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 1-2</text>
+        <text x="850" y="140" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 3</text>
+        <text x="850" y="250" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 4</text>
+        <text x="850" y="360" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 5-6</text>
+        <text x="850" y="470" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 7-9</text>
+        <text x="850" y="590" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 8</text>
+        <text x="850" y="710" text-anchor="middle" font-size="11" font-weight="600" fill="#4B3FE3" font-family="sans-serif">阶段 10</text>
+
+        <!-- Legend -->
+        <rect x="30" y="780" width="860" height="40" rx="8" fill="#F7F7F8" stroke="rgba(23,23,23,0.12)"/>
+        <rect x="50" y="792" width="16" height="3" fill="#4B3FE3"/>
+        <text x="72" y="798" font-size="11" fill="#52525B" font-family="sans-serif">主请求路径</text>
+        <rect x="170" y="792" width="16" height="3" fill="#27D2BF"/>
+        <text x="192" y="798" font-size="11" fill="#52525B" font-family="sans-serif">KV 异步传输</text>
+        <line x1="290" y1="793" x2="306" y2="793" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="312" y="798" font-size="11" fill="#52525B" font-family="sans-serif">元数据/释放信号</text>
+        <line x1="430" y1="793" x2="446" y2="793" stroke="#52525B" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="452" y="798" font-size="11" fill="#52525B" font-family="sans-serif">响应返回</text>
+        <text x="560" y="798" font-size="11" fill="#52525B" font-family="sans-serif">· 数字 ①-⑧ 表示时序</text>
+      </svg>
+      <div class="svg-caption">图 3-1：单次请求从接入到返回的 10 阶段完整流程</div>
+    </div>
+
+    <p class="callout">下文按 ① → ⑩ 的顺序逐段拆解。每段含：<strong>入口函数</strong> · <strong>关键代码</strong> · <strong>状态/数据流变化</strong>。</p>
+
+    <!-- Phase 1 -->
+    <h3 class="section-title" id="phase-1"><span class="phase-badge">1</span>阶段 1：HTTP 请求接入</h3>
+    <div class="card">
+      <p><strong>入口函数</strong>：<code>handle_completions_impl(api, request)</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L992">load_balance_proxy_server_example.py:992</a></p>
+<pre><code>async def handle_completions_impl(api: str, request: Request):
+    runtime = get_runtime()
+    args = get_global_args()
+    request_released = False
+    try:
+        req_data = await request.json()        # 解析 OpenAI 风格请求
+        req_body = await request.body()
+        request_length = len(req_body)         # 用于负载评分
+        instance_info = await assign_instances( # 选 P → 发 prefill → 选 D
+            api, req_data, request_length, is_initial_request=True)
+        stream_flag = bool(req_data.get("stream", False))
+        # ... 生成流式响应 ...
+        return StreamingResponse(generate_stream(), media_type=media_type)</code></pre>
+      <p><code>with_cancellation</code> 装饰器同时监听 <code>http.disconnect</code>，客户端断开时取消生成流。</p>
+    </div>
+
+    <!-- Phase 2 -->
+    <h3 class="section-title" id="phase-2"><span class="phase-badge">2</span>阶段 2：代理调度与选择 P 节点</h3>
+    <div class="card">
+      <p><strong>核心函数</strong>：<code>assign_instances()</code> 和 <code>SharedProxyScheduler</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L924">proxy:924</a> / <a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L265">:265</a></p>
+
+      <h4 class="sub-title">负载评分</h4>
+<pre><code>def calculate_prefill_score(request_length: int) -> float:
+    length_score = request_length / 4.0
+    return length_score * 0.0345 + 120.0745
+
+def calculate_decode_score(request_length: int) -> float:
+    return request_length</code></pre>
+
+      <h4 class="sub-title">懒删除小顶堆调度</h4>
+      <p><code>SharedProxyScheduler</code> 使用基于 <code>heapq</code> 的优先级队列，避免频繁删除：</p>
+<pre><code>def _pop_valid(self, role: ServerRole) -> str:
+    pool = self._pool(role)
+    while pool.heap:
+        _, _, seq, key = heapq.heappop(pool.heap)
+        if key not in pool.servers: continue       # 已删除
+        entry = pool.servers[key]
+        if entry.heap_seq == seq: return key        # 有效条目
+    raise RuntimeError(f"No available {role.value} servers")</code></pre>
+      <p>每次修改负载时入堆并递增 <code>heap_seq</code>，弹出时若 <code>heap_seq</code> 不匹配则跳过。</p>
+      <ul>
+        <li>P 节点优先级 = <code>active_tokens + active_kv_cache * 0.3</code></li>
+        <li>D 节点优先级 = <code>active_tokens</code></li>
+      </ul>
+
+      <h4 class="sub-title">构造预填充请求</h4>
+<pre><code>def build_prefill_request(req_data: dict) -> dict:
+    payload = req_data.copy()
+    payload["kv_transfer_params"] = {
+        "do_remote_decode": True,    # 告诉 P 节点只算 prefill
+        "do_remote_prefill": False,
+        "remote_engine_id": None, ...
+    }
+    payload["stream"] = False
+    payload["max_tokens"] = 1        # P 节点只输出 1 个 token
+    payload["min_tokens"] = 1
+    return payload</code></pre>
+    </div>
+
+    <!-- Phase 3 -->
+    <h3 class="section-title" id="phase-3"><span class="phase-badge">3</span>阶段 3：P 节点 EngineCore 调度</h3>
+    <div class="card">
+      <p><strong>核心类</strong>：<code>MooncakeConnectorScheduler</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1653">mooncake_connector.py:1653</a></p>
+
+      <h4 class="sub-title">初始化（L1656）</h4>
+      <p>保存以下关键状态：</p>
+      <ul>
+        <li><code>side_channel_host/port</code>：P 节点侧 ZMQ 握手端口</li>
+        <li><code>pcp_size / dcp_size / tp_size</code>：并行配置</li>
+        <li><code>_reqs_need_recv</code>：待拉取请求集合（D 节点侧）</li>
+        <li><code>_reqs_need_send</code>：待发送请求集合（P 节点侧）</li>
+        <li><code>_reqs_in_batch</code>：当前 batch 中的请求</li>
+      </ul>
+
+      <h4 class="sub-title">update_state_after_alloc（L1846）</h4>
+      <p>调度器在分配 KV 块后调用此方法，将请求加入待传输集合：</p>
+<pre><code>def update_state_after_alloc(self, request, blocks, num_external_tokens):
+    params = request.kv_transfer_params
+    if params.get("do_remote_prefill"):
+        # D 节点：记录需要从 P 拉取的请求
+        local_block_ids = blocks.get_unhashed_block_ids_all_groups()
+        self._reqs_need_recv[request.request_id] = (
+            request, local_block_ids, local_full_block_ids, num_external_tokens)
+        params["do_remote_prefill"] = False  # 只触发一次</code></pre>
+
+      <h4 class="sub-title">build_connector_meta（L1875）</h4>
+      <p>把 <code>_reqs_need_recv</code> 转换为 <code>MooncakeConnectorMetadata</code>，传递给 Worker：</p>
+<pre><code>def build_connector_meta(self, scheduler_output):
+    meta = MooncakeConnectorMetadata()
+    for req_id, (req, block_ids, full_block_ids, num_external_tokens) in self._reqs_need_recv.items():
+        meta.add_new_req(req_id, block_ids, full_block_ids, num_external_tokens, req.kv_transfer_params)
+    self._reqs_need_recv.clear()
+    meta.requests_to_send = self._reqs_need_send
+    self._reqs_need_send = {}
+    return meta</code></pre>
+    </div>
+
+    <!-- Phase 4 -->
+    <h3 class="section-title" id="phase-4"><span class="phase-badge">4</span>阶段 4：P 节点 Worker / ModelRunner 计算</h3>
+    <div class="card">
+      <p><strong>入口</strong>：<code>NPUWorker.execute_model()</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/worker/worker.py#L642">worker.py:642</a> → <a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py#L1756">model_runner_v1.py:1756</a></p>
+
+<pre><code>def execute_model(self, scheduler_output):
+    if has_kv_transfer_group():
+        kv_connector_metadata = scheduler_output.kv_connector_metadata
+        # 处理抢占：抢占的请求块需要先处理
+        get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+
+    # ... _update_states / _prepare_inputs ...
+
+    with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
+        # 模型前向
+        hidden_states = self._model_forward(num_tokens_padded, input_ids, positions, ...)
+
+    # PP 最后一级：计算 logits 并采样
+    logits = self.model.compute_logits(sample_hidden_states)
+    # ... sample_tokens() → 生成 1 个 token ...</code></pre>
+
+      <h4 class="sub-title">KV 角色判断</h4>
+      <p class="file-ref"><a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py#L717">model_runner_v1.py:717</a></p>
+<pre><code>def _is_pd_prefill_worker(self) -> bool:
+    return self.is_kv_producer and not self.is_kv_consumer</code></pre>
+      <p><code>is_kv_producer</code> / <code>is_kv_consumer</code> 由 <code>vllm_config.kv_transfer_config.is_kv_producer / is_kv_consumer</code> 决定（<a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py#L467">L467</a>）。</p>
+    </div>
+
+    <!-- Phase 5 -->
+    <h3 class="section-title" id="phase-5"><span class="phase-badge">5</span>阶段 5：P 节点 KV Cache 延迟释放</h3>
+    <div class="card card-brand">
+      <p><strong>核心函数</strong>：<code>MooncakeConnectorScheduler.request_finished()</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1904">mooncake_connector.py:1904</a></p>
+
+<pre><code>def request_finished(self, request, block_ids):
+    params = request.kv_transfer_params
+    # 仅当 do_remote_decode=True 且状态为 FINISHED_LENGTH_CAPPED 时延迟释放
+    if not params.get("do_remote_decode") or request.status != FINISHED_LENGTH_CAPPED:
+        return False, None
+
+    num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
+    computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
+    computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
+    delay_free_blocks = sum(len(b) for b in computed_block_ids) > 0
+
+    if delay_free_blocks:
+        self._reqs_need_send[request.request_id] = time.time()
+
+    # 返回 kv_transfer_params 给代理
+    return delay_free_blocks, dict(
+        do_remote_prefill=True,           # D 节点需要拉取
+        do_remote_decode=False,
+        remote_block_ids=computed_block_ids,
+        remote_engine_id=self.engine_id,
+        remote_host=self.side_channel_host,
+        remote_port=self.side_channel_port,
+        remote_pcp_size=self.pcp_size,
+        remote_dcp_size=self.dcp_size,
+        remote_ptp_size=self.tp_size,
+        last_token_id=request.output_token_ids[-1],
+        num_prompt_blocks=num_prompt_blocks,
+        remote_block_size=self.block_size,
+    )</code></pre>
+
+      <h4 class="sub-title">特殊处理：Mamba / 压缩模型截断</h4>
+      <p>对于 Mamba 等状态模型或压缩模型（<code>need_truncate=True</code>），P 节点会截断最后一个 prompt token（<code>_truncate_request_for_prefill</code>，<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1782">L1782</a>），使 P 节点计算 h(N-1) 而非 h(N)，D 节点重算最后一个 token 得到正确的 h(N)。</p>
+    </div>
+
+    <!-- Phase 6 -->
+    <h3 class="section-title" id="phase-6"><span class="phase-badge">6</span>阶段 6：代理选择 D 节点并转发</h3>
+    <div class="card">
+      <p><strong>函数</strong>：<code>assign_instances()</code> 后半段</p>
+      <p class="file-ref">文件：<a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L953">load_balance_proxy_server_example.py:953</a></p>
+
+<pre><code># P 节点返回后，提取 kv_transfer_params
+response_json = response.json()
+kv_transfer_params = response_json.get("kv_transfer_params", {})
+if kv_transfer_params:
+    req_data["kv_transfer_params"] = kv_transfer_params  # 合并到请求
+
+# 选 D 节点
+decoder = await runtime.schedule("pick_decoder", decoder_score)
+# 转发到 D 节点</code></pre>
+      <p>D 节点按 <code>active_tokens</code> 负载选出。</p>
+    </div>
+
+    <!-- Phase 7 -->
+    <h3 class="section-title" id="phase-7"><span class="phase-badge">7</span>阶段 7：D 节点 EngineCore 预分配与等待</h3>
+    <div class="card">
+      <p><strong>核心函数</strong>：<code>get_num_new_matched_tokens()</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1808">mooncake_connector.py:1808</a></p>
+
+<pre><code>def get_num_new_matched_tokens(self, request, num_computed_tokens):
+    params = request.kv_transfer_params
+    if params.get("do_remote_prefill"):
+        token_ids = request.prompt_token_ids or []
+        actual = self._state_prefill_token_count(len(token_ids))
+        params["num_computed_tokens"] = num_computed_tokens
+        count = max(actual - num_computed_tokens, 0)
+        if count > 0:
+            return count, True  # 异步加载
+    return 0, False</code></pre>
+      <p>返回 <code>(count, True)</code> 告诉调度器："这些 token 可从外部 KV 拉取，异步加载"。调度器将请求状态设为 <code>WAITING_FOR_REMOTE_KVS</code>，预分配 KV 块。</p>
+      <p>此时 <code>execute_model</code> 进入 <code>kv_connector_no_forward</code> 路径，阻塞等待 KV 拉取完成。</p>
+    </div>
+
+    <!-- Phase 8 -->
+    <h3 class="section-title" id="phase-8"><span class="phase-badge">8</span>阶段 8：D 节点异步拉取 KV Cache</h3>
+    <div class="card card-brand">
+      <p><strong>核心类</strong>：<code>KVCacheRecvingThread</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L410">mooncake_connector.py:410</a></p>
+
+      <h4 class="sub-title">初始化（L411-L546）</h4>
+<pre><code>class KVCacheRecvingThread(threading.Thread):
+    def __init__(self, ...):
+        # 三级队列结构
+        self.request_queue: queue.Queue[Any] = queue.Queue()       # ① 总队列
+        self.executor = ThreadPoolExecutor(max_workers=32, ...)     # ② 线程池
+        self.peer_request_queues: defaultdict[tuple, deque] = defaultdict(deque)  # ③ 按远端分桶
+        self.active_peer_request_handlers: set = set()
+        self.request_task_counts: defaultdict[str, int] = defaultdict(int)
+        self.task_tracker = KVCacheTaskTracker()</code></pre>
+
+      <h4 class="sub-title">run 循环（L614）</h4>
+<pre><code>def run(self):
+    self.ready_event.set()
+    while True:
+        request_data = self.request_queue.get()     # 从总队列取出
+        if request_data is None: continue
+        self._submit_request(request_data)</code></pre>
+
+      <h4 class="sub-title">_submit_request（L628）—— 按远端地址分派</h4>
+<pre><code>def _submit_request(self, request_data):
+    peer_key = (request_data["remote_host"], request_data["remote_handshake_port"])
+    self._mark_request_task_submitted(request_data)  # 计数+1
+    should_start_worker = False
+    with self.peer_request_queues_lock:
+        self.peer_request_queues[peer_key].append(request_data)
+        if peer_key not in self.active_peer_request_handlers:
+            self.active_peer_request_handlers.add(peer_key)
+            should_start_worker = True
+    if should_start_worker:
+        self.executor.submit(self._handle_peer_requests, peer_key)</code></pre>
+
+      <h4 class="sub-title">_handle_peer_requests（L641）—— 批量消费</h4>
+<pre><code>def _handle_peer_requests(self, peer_key):
+    requests_handled = 0
+    while requests_handled &lt; MAX_REQUESTS_PER_PEER_HANDLER:
+        with self.peer_request_queues_lock:
+            peer_queue = self.peer_request_queues.get(peer_key)
+            if not peer_queue:
+                self.active_peer_request_handlers.discard(peer_key)
+                return
+            req_meta = peer_queue.popleft()
+        requests_handled += 1
+        self._handle_request(req_meta)   # 真正传输
+
+    # 队列非空则重新提交自己
+    if should_resubmit:
+        self.executor.submit(self._handle_peer_requests, peer_key)</code></pre>
+
+      <p class="callout callout-accent">这一阶段是 PD 分离中最复杂的逻辑，详见 <a href="#async-queue">第四部分 4.1 异步队列机制</a>。</p>
+    </div>
+
+    <!-- Phase 9 -->
+    <h3 class="section-title" id="phase-9"><span class="phase-badge">9</span>阶段 9：P 节点发送侧逻辑</h3>
+    <div class="card">
+      <p><strong>核心类</strong>：<code>KVCacheSendingThread</code></p>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L246">mooncake_connector.py:246</a></p>
+
+      <p>P 节点的 <code>KVCacheSendingThread</code> 不主动发数据，而是作为 <strong>ZMQ 元数据服务器</strong>：</p>
+
+      <h4 class="sub-title">run（L292）—— 监听握手端口</h4>
+<pre><code>def run(self):
+    device_index = (self.pp_rank * self.pcp_size + self.pcp_rank) * self.tp_size + self.tp_rank
+    handshake_port = self.side_channel_port + device_index
+    path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
+    with zmq_ctx(zmq.ROUTER, path) as sock:
+        self.ready_event.set()
+        self.run_busy_loop(sock)</code></pre>
+
+      <h4 class="sub-title">run_busy_loop（L323）—— 处理两类消息</h4>
+<pre><code>def run_busy_loop(self, sock):
+    while True:
+        frames = sock.recv_multipart()
+        identity = frames[0]
+        msg = decoder.decode(frames[1])
+        if msg[0] == GET_META_MSG:
+            # D 节点请求元数据 → 返回 MooncakeAgentMetadata
+            sock.send_multipart((identity, b"", encoded_data))
+        elif msg[0] == DONE_RECVING_MSG:
+            # D 节点通知接收完成 → 释放 KV 块
+            request_id = msg[1]
+            self.task_tracker.update_done_task_count(request_id)
+            sock.send_multipart((identity, b"", b"ACK"), flags=zmq.NOBLOCK)</code></pre>
+      <p>这种设计让 P 节点的实际 KV 发送由 Mooncake TransferEngine 在 D 节点发起 <code>transfer</code> 时隐式完成。</p>
+    </div>
+
+    <!-- Phase 10 -->
+    <h3 class="section-title" id="phase-10"><span class="phase-badge">10</span>阶段 10：D 节点解码与响应返回</h3>
+    <div class="card">
+      <p>KV 拉取完成后，D 节点请求状态变为可调度。<code>NPUModelRunner.execute_model</code> 再次进入正常 forward 路径。</p>
+
+      <h4 class="sub-title">代理流式转发</h4>
+      <p class="file-ref">文件：<a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L1013">load_balance_proxy_server_example.py:1013</a></p>
+<pre><code>async def generate_stream():
+    while retry:
+        retry = False
+        decoder_client = await runtime.get_client(ServerRole.DECODE, instance_info.decoder_key)
+        async for chunk in stream_service_response_with_retry(...):
+            if not released_kv and chunk:
+                await release_prefill_kv_once()  # 收到首 chunk → 释放 P 节点 KV
+            # ... 处理 chunk, 转发给用户 ...
+
+    # 请求结束
+    finally:
+        await _finish_instance(runtime, instance_info, release_prefill_kv=not released_kv)</code></pre>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- 第四部分 · 核心机制深度解析                                    -->
+    <!-- ============================================================ -->
+    <div class="part-banner">
+      <div class="part-label">PART 4</div>
+      <h2>核心机制深度解析</h2>
+      <p class="part-summary">把第三部分提到的「异步队列」与「KV 传输」单独展开，并补充错误处理与重试策略。这是 PD 分离实现的关键所在。</p>
+    </div>
+
+    <h3 class="section-title" id="async-queue">4.1 异步队列机制（三级流水线）</h3>
+    <p><code>KVCacheRecvingThread</code> 使用三级队列 + 线程池实现高并发下的 KV 拉取，避免单线程瓶颈。</p>
+
+    <div class="svg-container">
+      <svg viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="queueArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#52525B"/>
+          </marker>
+          <marker id="queueArrowBrand" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+            <path d="M1 1 L7 4 L1 7 Z" fill="#4B3FE3"/>
+          </marker>
+        </defs>
+
+        <!-- Level 1 -->
+        <rect x="30" y="20" width="860" height="60" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="460" y="45" text-anchor="middle" font-size="13" font-weight="600" fill="#171717" font-family="sans-serif">① request_queue (queue.Queue)</text>
+        <text x="460" y="65" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">生产者: ModelRunner.start_load_kv → add_request()  |  消费者: run() 单线程取出</text>
+
+        <path d="M460 80 V100" fill="none" stroke="#4B3FE3" stroke-width="1.8" marker-end="url(#queueArrowBrand)"/>
+
+        <!-- Level 2 -->
+        <rect x="30" y="110" width="860" height="70" rx="8" fill="#F2F7FF" stroke="#4B3FE3" stroke-width="1.5"/>
+        <text x="460" y="135" text-anchor="middle" font-size="13" font-weight="600" fill="#1A1759" font-family="sans-serif">② _submit_request: 按远端地址分派</text>
+        <text x="460" y="155" text-anchor="middle" font-size="11" fill="#4B3FE3" font-family="sans-serif">peer_key = (remote_host, remote_handshake_port)</text>
+        <text x="460" y="170" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">同一远端请求串行化, 避免并发握手冲突</text>
+
+        <path d="M200 180 V200" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+        <path d="M460 180 V200" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+        <path d="M720 180 V200" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+
+        <!-- Level 3 -->
+        <rect x="60" y="210" width="280" height="60" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="200" y="235" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">peer_queue[P1]</text>
+        <text x="200" y="255" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">deque[req1, req2, req3...]</text>
+
+        <rect x="320" y="210" width="280" height="60" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="460" y="235" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">peer_queue[P2]</text>
+        <text x="460" y="255" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">deque[req4, req5...]</text>
+
+        <rect x="580" y="210" width="280" height="60" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="720" y="235" text-anchor="middle" font-size="12" font-weight="500" fill="#171717" font-family="sans-serif">peer_queue[P3]</text>
+        <text x="720" y="255" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">deque[req6...]</text>
+
+        <path d="M200 270 V290" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+        <path d="M460 270 V290" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+        <path d="M720 270 V290" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+
+        <!-- Level 4 -->
+        <rect x="60" y="300" width="280" height="70" rx="8" fill="#EAFBF8" stroke="#27D2BF" stroke-width="1.5"/>
+        <text x="200" y="325" text-anchor="middle" font-size="12" font-weight="600" fill="#0F766E" font-family="sans-serif">handler_thread_1</text>
+        <text x="200" y="345" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">_handle_peer_requests(P1)</text>
+        <text x="200" y="360" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">批量处理 MAX_REQUESTS_PER_PEER_HANDLER</text>
+
+        <rect x="320" y="300" width="280" height="70" rx="8" fill="#EAFBF8" stroke="#27D2BF" stroke-width="1.5"/>
+        <text x="460" y="325" text-anchor="middle" font-size="12" font-weight="600" fill="#0F766E" font-family="sans-serif">handler_thread_2</text>
+        <text x="460" y="345" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">_handle_peer_requests(P2)</text>
+        <text x="460" y="360" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">批量处理</text>
+
+        <rect x="580" y="300" width="280" height="70" rx="8" fill="#EAFBF8" stroke="#27D2BF" stroke-width="1.5"/>
+        <text x="720" y="325" text-anchor="middle" font-size="12" font-weight="600" fill="#0F766E" font-family="sans-serif">handler_thread_3</text>
+        <text x="720" y="345" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">_handle_peer_requests(P3)</text>
+        <text x="720" y="360" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">批量处理</text>
+
+        <path d="M200 370 V390" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+        <path d="M460 370 V390" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+        <path d="M720 370 V390" fill="none" stroke="#52525B" stroke-width="1.5" marker-end="url(#queueArrow)"/>
+
+        <!-- Level 5 -->
+        <rect x="60" y="400" width="800" height="50" rx="8" fill="#EFEFF2" stroke="rgba(23,23,23,0.12)"/>
+        <text x="460" y="425" text-anchor="middle" font-size="13" font-weight="600" fill="#171717" font-family="sans-serif">③ _transfer_kv_cache_all_groups → Mooncake TransferEngine.transfer(RDMA)</text>
+        <text x="460" y="443" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">构造 (src_addr, dst_addr, length) 列表, 执行 P2P 内存拷贝</text>
+
+        <!-- Task counting -->
+        <rect x="30" y="470" width="860" height="40" rx="8" fill="#F7F7F8" stroke="rgba(23,23,23,0.12)"/>
+        <text x="460" y="495" text-anchor="middle" font-size="11" fill="#52525B" font-family="sans-serif">任务计数: request_task_counts[req_id] → 全部 shard 完成 → task_tracker.update_done_task_count → get_finished() 返回 EngineCore</text>
+      </svg>
+      <div class="svg-caption">图 4-1：KVCacheRecvingThread 三级队列流水线</div>
+    </div>
+
+    <h4 class="sub-title">为什么需要三级队列？</h4>
+    <ul>
+      <li><strong>第一级 request_queue</strong>：单线程消费，作为入口缓冲，避免上游阻塞。</li>
+      <li><strong>第二级 peer_request_queues</strong>：按 <code>(remote_host, remote_handshake_port)</code> 分桶，<strong>同一 P 节点的请求串行化</strong>，避免并发 ZMQ 握手冲突；不同 P 节点之间仍可并发。</li>
+      <li><strong>第三级 ThreadPoolExecutor</strong>：每个 peer 一个 handler 线程，批量处理 <code>MAX_REQUESTS_PER_PEER_HANDLER</code> 个请求后重新自提交，保证持续消费。</li>
+    </ul>
+
+    <h4 class="sub-title">任务计数与完成判定</h4>
+<pre><code>def _mark_request_task_submitted(self, req_meta):
+    request_id = req_meta["request_id"]
+    with self.request_task_counts_lock:
+        self.request_task_counts[request_id] += 1
+        if req_meta["all_task_done"]:
+            self.finished_request_markers.add(request_id)
+
+def _mark_request_task_done(self, request_id, all_task_done) -> bool:
+    with self.request_task_counts_lock:
+        pending_count = self.request_task_counts.get(request_id)
+        if pending_count is None: return all_task_done
+        pending_count -= 1
+        if pending_count > 0:
+            self.request_task_counts[request_id] = pending_count
+            return False  # 还有未完成的 shard
+        # 全部完成
+        self.request_task_counts.pop(request_id, None)
+        has_finished_marker = request_id in self.finished_request_markers
+        self.finished_request_markers.discard(request_id)
+        return has_finished_marker</code></pre>
+
+    <h4 class="sub-title">设计要点：并发度 vs 一致性</h4>
+    <div class="callout">
+      <ul>
+        <li><strong>串行化粒度</strong>：peer 级别，保证同一 P 节点的 ZMQ 会话不交错。</li>
+        <li><strong>并发度</strong>：不同 peer 之间完全并发，受 <code>max_workers=32</code> 限制。</li>
+        <li><strong>批量上限</strong>：<code>MAX_REQUESTS_PER_PEER_HANDLER</code> 防止单个 handler 独占线程池过久，强制让出。</li>
+        <li><strong>重入机制</strong>：handler 处理完一个批次后，若队列非空则 <code>self.executor.submit(self._handle_peer_requests, peer_key)</code> 自递归。</li>
+      </ul>
+    </div>
+
+    <h3 class="section-title" id="kv-mechanism">4.2 KV 传输内部机制</h3>
+
+    <div class="card">
+      <h4 class="sub-title">register_kv_caches（L2395）—— KV Cache 注册</h4>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L2395">mooncake_connector.py:2395</a></p>
+      <ul>
+        <li>计算每层 KV tensor 的 <code>base_addr</code>、<code>block_len</code>、<code>block_stride</code>、<code>block_size_scale</code>。</li>
+        <li>通过 <code>global_te.register_buffer(ptrs, lengths)</code> 向 Mooncake TransferEngine 注册 NPU 内存区域。</li>
+        <li>构造 <code>MooncakeAgentMetadata</code>（含 engine_id、端口、层映射、块元数据）。</li>
+        <li>根据角色启动 <code>KVCacheSendingThread</code> 或 <code>KVCacheRecvingThread</code>。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h4 class="sub-title">_get_kv_split_metadata（L2738）—— 并行映射核心</h4>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L2738">mooncake_connector.py:2738</a></p>
+      <p>计算每个 D rank 该从哪些 P rank 拉哪些块。支持 TP/CP 不匹配场景：</p>
+      <ul>
+        <li><strong>无 CP/TP 差异</strong>：简单扩展 kernel block id，按 <code>_get_remote_rank</code> 哈希选择 P rank。</li>
+        <li><strong>有 CP/TP 差异</strong>：按 head group 和 CP group 计算端口映射 <code>local_remote_block_port_mappings</code>，保证 D 节点每个 rank 从正确的 P rank 拉取所需 KV shard。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h4 class="sub-title">_transfer_kv_cache_all_groups（L749）—— 真正传输</h4>
+      <p class="file-ref">文件：<a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L749">mooncake_connector.py:749</a></p>
+      <ol>
+        <li>检查本地是否已有远端 metadata，没有则通过 ZMQ 握手获取（<code>_get_remote_metadata</code>）。</li>
+        <li>按 <code>group_pulls</code> 遍历每个 KV group，把逻辑 block id 展开为 kernel block id。</li>
+        <li>构造 <code>(src_addr, dst_addr, length)</code> 列表，调用 Mooncake TransferEngine 的 <code>transfer</code> 完成 RDMA/P2P 拷贝。</li>
+        <li>处理 Mamba 状态组（非 block-sharded）和 Attention 组的不同地址映射。</li>
+      </ol>
+    </div>
+
+    <h3 class="section-title" id="error-retry">4.3 错误处理与重试</h3>
+
+    <div class="card card-danger">
+      <h4 class="sub-title">单请求传输失败 → 标记 invalid</h4>
+<pre><code>def _handle_request(self, req_meta):
+    transfer_failed = self._is_failed_recv_request(request_id)
+    try:
+        if transfer_failed:
+            self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
+        else:
+            self._transfer_kv_cache_all_groups(req_meta)
+    except Exception:
+        transfer_failed = True
+        self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
+    finally:
+        # 发送完成信号到 P 节点
+        self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)</code></pre>
+      <p>一旦某请求传输失败，其 <code>local_block_ids</code> 被标记为 invalid。EngineCore 检测到后把请求状态从 <code>WAITING_FOR_REMOTE_KVS</code> 改为重新计算（recompute），D 节点自己重做预填充。</p>
+    </div>
+
+    <div class="card card-danger">
+      <h4 class="sub-title">代理层重算重试</h4>
+      <p>若 D 节点返回 <code>stop_reason == "recomputed"</code>（KV 传输失败或前缀缓存不一致），代理重新选择 P/D 节点重试：</p>
+<pre><code>if stop_reason == "recomputed":
+    retry = True
+    retry_count += 1
+    # 拼接已生成 token 到 prompt
+    req_data["prompt"] = origin_prompt + generated_token
+    req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+    instance_info = await reassign_instances(api, req_data, tmp_request_length, instance_info)</code></pre>
+    </div>
+
+    <div class="card card-danger">
+      <h4 class="sub-title">P 节点延迟释放与超时兜底</h4>
+      <p class="file-ref"><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L222">mooncake_connector.py:222</a></p>
+<pre><code>def _retrieve_expired_requests(self):
+    expired_requests: set[str] = set()
+    current_time = time.time()
+    while self.delayed_free_requests:
+        request_id = next(iter(self.delayed_free_requests))
+        delay_start_time = self.delayed_free_requests[request_id]
+        if current_time - delay_start_time > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
+            # 超时强制释放, 防止 D 节点崩溃导致 P 节点内存泄漏
+            self.delayed_free_requests.popitem(last=False)
+            self.reqs_to_process.discard(request_id)
+            expired_requests.add(request_id)
+        else:
+            break
+    return expired_requests</code></pre>
+      <p class="callout callout-danger">超时兜底是关键防泄漏机制：若 D 节点崩溃不发 <code>DONE_RECVING_MSG</code>，P 节点会按超时强制释放 KV 块，避免内存被永久占用。</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- 第五部分 · 代码索引                                            -->
+    <!-- ============================================================ -->
+    <div class="part-banner">
+      <div class="part-label">PART 5</div>
+      <h2>关键代码索引</h2>
+      <p class="part-summary">按模块分类整理所有提及的函数 / 类与其代码位置，便于跳转源码。</p>
+    </div>
+
+    <h3 class="section-title" id="key-funcs">5.1 关键函数索引</h3>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4 class="sub-title">代理层</h4>
+        <table>
+          <tr><th>函数</th><th>位置</th></tr>
+          <tr><td><code>handle_completions_impl</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L992">proxy:992</a></td></tr>
+          <tr><td><code>assign_instances</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L924">proxy:924</a></td></tr>
+          <tr><td><code>build_prefill_request</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L818">proxy:818</a></td></tr>
+          <tr><td><code>SharedProxyScheduler</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L265">proxy:265</a></td></tr>
+          <tr><td><code>_pick_server / _pop_valid</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L319">proxy:319</a></td></tr>
+          <tr><td><code>generate_stream</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L1013">proxy:1013</a></td></tr>
+          <tr><td><code>reassign_instances</code></td><td><a href="file:///workspace/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L980">proxy:980</a></td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h4 class="sub-title">KV 传输层</h4>
+        <table>
+          <tr><th>类/函数</th><th>位置</th></tr>
+          <tr><td><code>MooncakeConnector</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1509">mc:1509</a></td></tr>
+          <tr><td><code>MooncakeConnectorScheduler</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1653">mc:1653</a></td></tr>
+          <tr><td><code>get_num_new_matched_tokens</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1808">mc:1808</a></td></tr>
+          <tr><td><code>update_state_after_alloc</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1846">mc:1846</a></td></tr>
+          <tr><td><code>build_connector_meta</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1875">mc:1875</a></td></tr>
+          <tr><td><code>request_finished</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1904">mc:1904</a></td></tr>
+          <tr><td><code>MooncakeConnectorWorker</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L1998">mc:1998</a></td></tr>
+          <tr><td><code>register_kv_caches</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L2395">mc:2395</a></td></tr>
+          <tr><td><code>_get_kv_split_metadata</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L2738">mc:2738</a></td></tr>
+          <tr><td><code>KVCacheSendingThread</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L246">mc:246</a></td></tr>
+          <tr><td><code>KVCacheRecvingThread</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L410">mc:410</a></td></tr>
+          <tr><td><code>_handle_peer_requests</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L641">mc:641</a></td></tr>
+          <tr><td><code>_transfer_kv_cache_all_groups</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L749">mc:749</a></td></tr>
+          <tr><td><code>KVCacheTaskTracker</code></td><td><a href="file:///workspace/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py#L167">mc:167</a></td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h4 class="sub-title">Worker / ModelRunner 层</h4>
+      <table>
+        <tr><th>函数</th><th>位置</th></tr>
+        <tr><td><code>NPUWorker.execute_model</code></td><td><a href="file:///workspace/vllm_ascend/worker/worker.py#L642">worker.py:642</a></td></tr>
+        <tr><td><code>NPUModelRunner.execute_model</code></td><td><a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py#L1756">mr_v1:1756</a></td></tr>
+        <tr><td><code>NPUModelRunner.sample_tokens</code></td><td><a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py#L2182">mr_v1:2182</a></td></tr>
+        <tr><td><code>_is_pd_prefill_worker</code></td><td><a href="file:///workspace/vllm_ascend/worker/model_runner_v1.py#L717">mr_v1:717</a></td></tr>
+        <tr><td><code>initialize_from_config</code></td><td><a href="file:///workspace/vllm_ascend/worker/worker.py#L984">worker.py:984</a></td></tr>
+        <tr><td><code>get_kv_connector_handshake_metadata</code></td><td><a href="file:///workspace/vllm_ascend/worker/worker.py#L909">worker.py:909</a></td></tr>
+      </table>
+    </div>
+
+    <footer>
+      vLLM Ascend PD 分离特性全流程解析 · 重排版生成于 2026-08-26<br>
+      基于代码仓库 <code>/workspace</code> · MooncakeConnector Pull 模式
+    </footer>
+
+  </main>
+</div>
+
+</body>
+</html>
