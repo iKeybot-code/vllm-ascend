@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM Attention 结构图解与 KV Cache / Prefix Cache 逻辑</title>
+<style>
+:root{
+  --bg:#0f172a; --card:#1e293b; --card2:#334155;
+  --text:#e2e8f0; --muted:#94a3b8;
+  --primary:#3b82f6; --primary-d:#1d4ed8;
+  --accent:#f59e0b; --success:#10b981; --danger:#ef4444; --purple:#a855f7; --cyan:#06b6d4;
+  --q-color:#3b82f6; --k-color:#ef4444; --v-color:#10b981; --o-color:#a855f7;
+  --border:#475569;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.7}
+header{background:linear-gradient(135deg,#1e3a8a,#7c3aed 60%,#db2777);padding:3rem 1.5rem;text-align:center}
+header h1{font-size:2rem;font-weight:800}
+header p{margin-top:.5rem;color:#c7d2fe;font-size:1.05rem}
+nav{position:sticky;top:0;z-index:100;background:rgba(15,23,42,.95);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);padding:.75rem 1rem;overflow-x:auto}
+nav ul{list-style:none;display:flex;gap:.75rem;white-space:nowrap;justify-content:center}
+nav a{color:var(--muted);text-decoration:none;font-size:.85rem;padding:.35rem .7rem;border-radius:.4rem;transition:.2s}
+nav a:hover{background:var(--card2);color:var(--text)}
+main{max-width:1200px;margin:0 auto;padding:2rem 1rem 4rem}
+section{background:var(--card);border-radius:1rem;padding:2rem;margin-bottom:2rem;border:1px solid var(--border)}
+h2{color:var(--primary);border-bottom:2px solid var(--border);padding-bottom:.5rem;margin-bottom:1rem;font-size:1.5rem}
+h3{color:var(--text);margin:1.5rem 0 .75rem;font-size:1.15rem}
+h4{color:var(--accent);margin:1rem 0 .5rem;font-size:1rem}
+p{color:var(--muted);margin:.5rem 0}
+.diagram-wrap{background:var(--card2);border-radius:.75rem;padding:1.5rem 1rem;margin:1rem 0;overflow-x:auto;text-align:center}
+.diagram-wrap svg{max-width:100%;height:auto}
+.diagram-caption{color:var(--muted);font-size:.85rem;margin-top:.5rem;font-style:italic}
+.legend{display:flex;flex-wrap:wrap;gap:1rem;margin:.75rem 0;justify-content:center}
+.legend-item{display:flex;align-items:center;gap:.4rem;font-size:.85rem;color:var(--muted)}
+.legend-swatch{width:16px;height:16px;border-radius:3px;display:inline-block}
+.tag{display:inline-block;padding:.15rem .5rem;border-radius:.25rem;font-size:.7rem;font-weight:700;margin-right:.3rem}
+.tag-hot{background:#fef3c7;color:#92400e}
+.tag-core{background:#dbeafe;color:#1e40af}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
+@media(max-width:768px){.grid2{grid-template-columns:1fr}}
+.note{background:rgba(59,130,246,.1);border-left:4px solid var(--primary);padding:.75rem 1rem;border-radius:0 .5rem .5rem 0;margin:1rem 0;color:var(--text);font-size:.9rem}
+.warn{background:rgba(245,158,11,.1);border-left:4px solid var(--accent);padding:.75rem 1rem;border-radius:0 .5rem .5rem 0;margin:1rem 0;color:var(--text);font-size:.9rem}
+code{background:rgba(148,163,184,.15);padding:.15rem .35rem;border-radius:.25rem;font-size:.85em;color:#67e8f9}
+footer{text-align:center;padding:2rem;color:var(--muted);font-size:.8rem;border-top:1px solid var(--border)}
+.svg-label{fill:#e2e8f0;font-family:inherit;font-size:13px}
+.svg-label-sm{fill:#94a3b8;font-size:11px}
+.svg-label-bold{fill:#f1f5f9;font-size:14px;font-weight:bold}
+.svg-arrow{stroke:#64748b;stroke-width:1.5;fill:none;marker-end:url(#arrowhead)}
+.svg-box{stroke-width:2}
+</style>
+</head>
+<body>
+
+<!-- SVG defs -->
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#ef4444"/>
+    </marker>
+  </defs>
+</svg>
+
+<header>
+  <h1>vLLM Attention 结构图解与 KV Cache / Prefix Cache 逻辑</h1>
+  <p>MHA · MQA · GQA · MLA · FlashAttention · PagedAttention · KV Cache · Prefix Cache 全景图解</p>
+</header>
+
+<nav>
+<ul>
+<li><a href="#attn-struct">Attention 结构</a></li>
+<li><a href="#flash">FlashAttention</a></li>
+<li><a href="#paged">PagedAttention</a></li>
+<li><a href="#kv">KV Cache 存储</a></li>
+<li><a href="#prefix">Prefix Cache</a></li>
+<li><a href="#lifecycle">Cache 生命周期</a></li>
+</ul>
+</nav>
+
+<main>
+
+<!-- =================== Attention 结构对比 =================== -->
+<section id="attn-struct">
+<h2>1. Attention 结构对比：MHA / MQA / GQA / MLA</h2>
+
+<div class="legend">
+<div class="legend-item"><span class="legend-swatch" style="background:#3b82f6"></span>Query</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#ef4444"></span>Key</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#10b981"></span>Value</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#a855f7"></span>Output</div>
+</div>
+
+<h3>1.1 MHA — Multi-Head Attention（标准多头）</h3>
+<p>每个 Query 头拥有独立的 Key 和 Value 头。KV Cache 显存与 <code>num_heads</code> 成正比。</p>
+<div class="diagram-wrap">
+<svg viewBox="0 0 600 250" width="600" xmlns="http://www.w3.org/2000/svg">
+  <!-- Input -->
+  <text x="10" y="70" class="svg-label" font-size="12">Input</text>
+  <rect x="40" y="55" width="50" height="140" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="4"/>
+  <!-- Q heads -->
+  <g>
+    <rect x="130" y="55" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/>
+    <text x="150" y="73" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q1</text>
+    <rect x="130" y="90" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/>
+    <text x="150" y="108" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q2</text>
+    <rect x="130" y="125" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/>
+    <text x="150" y="143" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q3</text>
+    <rect x="130" y="160" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/>
+    <text x="150" y="178" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q4</text>
+  </g>
+  <!-- K heads -->
+  <g>
+    <rect x="250" y="55" width="40" height="30" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/>
+    <text x="270" y="73" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K1</text>
+    <rect x="250" y="90" width="40" height="30" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/>
+    <text x="270" y="108" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K2</text>
+    <rect x="250" y="125" width="40" height="30" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/>
+    <text x="270" y="143" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K3</text>
+    <rect x="250" y="160" width="40" height="30" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/>
+    <text x="270" y="178" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K4</text>
+  </g>
+  <!-- V heads -->
+  <g>
+    <rect x="370" y="55" width="40" height="30" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/>
+    <text x="390" y="73" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V1</text>
+    <rect x="370" y="90" width="40" height="30" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/>
+    <text x="390" y="108" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V2</text>
+    <rect x="370" y="125" width="40" height="30" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/>
+    <text x="390" y="143" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V3</text>
+    <rect x="370" y="160" width="40" height="30" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/>
+    <text x="390" y="178" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V4</text>
+  </g>
+  <!-- Output -->
+  <g>
+    <rect x="490" y="55" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/>
+    <text x="510" y="73" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O1</text>
+    <rect x="490" y="90" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/>
+    <text x="510" y="108" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O2</text>
+    <rect x="490" y="125" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/>
+    <text x="510" y="143" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O3</text>
+    <rect x="490" y="160" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/>
+    <text x="510" y="178" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O4</text>
+  </g>
+  <!-- Arrows Q->K -->
+  <line x1="170" y1="70" x2="250" y2="70" class="svg-arrow" stroke="#64748b"/>
+  <line x1="170" y1="105" x2="250" y2="105" class="svg-arrow" stroke="#64748b"/>
+  <line x1="170" y1="140" x2="250" y2="140" class="svg-arrow" stroke="#64748b"/>
+  <line x1="170" y1="175" x2="250" y2="175" class="svg-arrow" stroke="#64748b"/>
+  <!-- Arrows K->V -->
+  <line x1="290" y1="70" x2="370" y2="70" class="svg-arrow" stroke="#64748b"/>
+  <line x1="290" y1="105" x2="370" y2="105" class="svg-arrow" stroke="#64748b"/>
+  <line x1="290" y1="140" x2="370" y2="140" class="svg-arrow" stroke="#64748b"/>
+  <line x1="290" y1="175" x2="370" y2="175" class="svg-arrow" stroke="#64748b"/>
+  <!-- Arrows V->O -->
+  <line x1="410" y1="70" x2="490" y2="70" class="svg-arrow" stroke="#64748b"/>
+  <line x1="410" y1="105" x2="490" y2="105" class="svg-arrow" stroke="#64748b"/>
+  <line x1="410" y1="140" x2="490" y2="140" class="svg-arrow" stroke="#64748b"/>
+  <line x1="410" y1="175" x2="490" y2="175" class="svg-arrow" stroke="#64748b"/>
+  <!-- label -->
+  <text x="170" y="225" text-anchor="middle" class="svg-label" font-size="12">num_heads = num_kv_heads = 4</text>
+  <text x="380" y="225" text-anchor="middle" class="svg-label-sm">每头独立 KV · KV Cache = num_heads × seq_len × head_dim</text>
+</svg>
+</div>
+<p class="diagram-caption">MHA：4 个 Query 头对应 4 组独立 KV，KV Cache 占用最大。</p>
+
+<h3>1.2 MQA — Multi-Query Attention</h3>
+<p>所有 Query 头共享 <strong>1 组</strong> Key/Value。KV Cache 显存降至 MHA 的 <code>1/num_heads</code>，但质量有所下降。</p>
+<div class="diagram-wrap">
+<svg viewBox="0 0 600 250" width="600" xmlns="http://www.w3.org/2000/svg">
+  <!-- Q heads -->
+  <g>
+    <rect x="130" y="55" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="150" y="73" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q1</text>
+    <rect x="130" y="90" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="150" y="108" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q2</text>
+    <rect x="130" y="125" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="150" y="143" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q3</text>
+    <rect x="130" y="160" width="40" height="30" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="150" y="178" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q4</text>
+  </g>
+  <!-- Single K -->
+  <rect x="270" y="107" width="40" height="35" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/>
+  <text x="290" y="128" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K (1组)</text>
+  <!-- Single V -->
+  <rect x="390" y="107" width="40" height="35" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/>
+  <text x="410" y="128" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V (1组)</text>
+  <!-- All Q converge to single K -->
+  <line x1="170" y1="70" x2="270" y2="115" class="svg-arrow" stroke="#64748b"/>
+  <line x1="170" y1="105" x2="270" y2="120" class="svg-arrow" stroke="#64748b"/>
+  <line x1="170" y1="140" x2="270" y2="130" class="svg-arrow" stroke="#64748b"/>
+  <line x1="170" y1="175" x2="270" y2="135" class="svg-arrow" stroke="#64748b"/>
+  <!-- K->V -->
+  <line x1="310" y1="124" x2="390" y2="124" class="svg-arrow" stroke="#64748b"/>
+  <!-- V -> O heads -->
+  <g>
+    <rect x="490" y="55" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="510" y="73" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O1</text>
+    <rect x="490" y="90" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="510" y="108" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O2</text>
+    <rect x="490" y="125" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="510" y="143" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O3</text>
+    <rect x="490" y="160" width="40" height="30" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="510" y="178" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O4</text>
+  </g>
+  <line x1="430" y1="115" x2="490" y2="70" class="svg-arrow" stroke="#64748b"/>
+  <line x1="430" y1="120" x2="490" y2="105" class="svg-arrow" stroke="#64748b"/>
+  <line x1="430" y1="130" x2="490" y2="140" class="svg-arrow" stroke="#64748b"/>
+  <line x1="430" y1="135" x2="490" y2="175" class="svg-arrow" stroke="#64748b"/>
+  <text x="300" y="225" text-anchor="middle" class="svg-label-sm">num_heads=4, num_kv_heads=1 · KV Cache = seq_len × head_dim（缩小 4 倍）</text>
+</svg>
+</div>
+
+<h3>1.3 GQA — Grouped-Query Attention</h3>
+<p>Query 头分组，每组共享一组 KV。是 MHA 与 MQA 的折中方案，vLLM 默认路径。</p>
+<div class="diagram-wrap">
+<svg viewBox="0 0 600 250" width="600" xmlns="http://www.w3.org/2000/svg">
+  <!-- Q heads: Q1,Q2 share KV1; Q3,Q4 share KV2 -->
+  <g>
+    <rect x="120" y="55" width="40" height="25" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="140" y="72" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q1</text>
+    <rect x="120" y="85" width="40" height="25" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="140" y="102" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q2</text>
+    <rect x="120" y="140" width="40" height="25" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="140" y="157" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q3</text>
+    <rect x="120" y="170" width="40" height="25" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="140" y="187" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">Q4</text>
+  </g>
+  <!-- KV1 -->
+  <rect x="260" y="60" width="45" height="30" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/><text x="282" y="78" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K1</text>
+  <rect x="380" y="60" width="45" height="30" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/><text x="402" y="78" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V1</text>
+  <!-- KV2 -->
+  <rect x="260" y="145" width="45" height="30" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/><text x="282" y="163" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">K2</text>
+  <rect x="380" y="145" width="45" height="30" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/><text x="402" y="163" text-anchor="middle" class="svg-label-sm" fill="#d1fae5">V2</text>
+  <!-- O -->
+  <g>
+    <rect x="500" y="55" width="40" height="25" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="520" y="72" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O1</text>
+    <rect x="500" y="85" width="40" height="25" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="520" y="102" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O2</text>
+    <rect x="500" y="140" width="40" height="25" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="520" y="157" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O3</text>
+    <rect x="500" y="170" width="40" height="25" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="3"/><text x="520" y="187" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O4</text>
+  </g>
+  <!-- Arrows: Q1,Q2 -> K1 -->
+  <line x1="160" y1="67" x2="260" y2="72" class="svg-arrow" stroke="#64748b"/>
+  <line x1="160" y1="97" x2="260" y2="78" class="svg-arrow" stroke="#64748b"/>
+  <line x1="305" y1="75" x2="380" y2="75" class="svg-arrow" stroke="#64748b"/>
+  <line x1="425" y1="72" x2="500" y2="67" class="svg-arrow" stroke="#64748b"/>
+  <line x1="425" y1="78" x2="500" y2="97" class="svg-arrow" stroke="#64748b"/>
+  <!-- Q3,Q4 -> K2 -->
+  <line x1="160" y1="152" x2="260" y2="157" class="svg-arrow" stroke="#64748b"/>
+  <line x1="160" y1="182" x2="260" y2="163" class="svg-arrow" stroke="#64748b"/>
+  <line x1="305" y1="160" x2="380" y2="160" class="svg-arrow" stroke="#64748b"/>
+  <line x1="425" y1="157" x2="500" y2="152" class="svg-arrow" stroke="#64748b"/>
+  <line x1="425" y1="163" x2="500" y2="182" class="svg-arrow" stroke="#64748b"/>
+  <text x="300" y="225" text-anchor="middle" class="svg-label-sm">num_heads=4, num_kv_heads=2 · 每 2 个 Q 头共享 1 组 KV · KV Cache 缩小 2 倍</text>
+</svg>
+</div>
+
+<h3>1.4 MLA — Multi-head Latent Attention（DeepSeek）</h3>
+<p>将 KV 压缩到低秩 latent 向量再展开，大幅降低 KV Cache 大小。同时用解耦 RoPE 维持位置编码。</p>
+<div class="diagram-wrap">
+<svg viewBox="0 0 680 280" width="680" xmlns="http://www.w3.org/2000/svg">
+  <!-- Hidden states -->
+  <rect x="20" y="100" width="50" height="80" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="4"/>
+  <text x="45" y="145" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">hidden</text>
+
+  <!-- Q low-rank -->
+  <rect x="110" y="50" width="60" height="50" fill="#1e40af" stroke="#3b82f6" class="svg-box" rx="4"/>
+  <text x="140" y="70" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">W_DQ</text>
+  <text x="140" y="85" text-anchor="middle" class="svg-label-sm" fill="#94a3b8">(q_lora)</text>
+
+  <!-- KV latent -->
+  <rect x="110" y="180" width="60" height="60" fill="#7f1d1d" stroke="#ef4444" class="svg-box" rx="4"/>
+  <text x="140" y="200" text-anchor="middle" class="svg-label-sm" fill="#fee2e2">W_DKV</text>
+  <text x="140" y="215" text-anchor="middle" class="svg-label-sm" fill="#94a3b8">(kv_lora)</text>
+  <text x="140" y="230" text-anchor="middle" class="svg-label-sm" fill="#94a3b8">压缩 latent</text>
+
+  <!-- latent vector -->
+  <rect x="200" y="190" width="50" height="40" fill="#7c2d12" stroke="#fb923c" class="svg-box" rx="3"/>
+  <text x="225" y="215" text-anchor="middle" class="svg-label-sm" fill="#fed7aa">c_KV</text>
+
+  <!-- Q heads after up-projection -->
+  <g>
+    <rect x="210" y="45" width="35" height="20" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="227" y="59" text-anchor="middle" class="svg-label-sm" fill="#dbeafe" font-size="9">Q1</text>
+    <rect x="210" y="68" width="35" height="20" fill="#2563eb" stroke="#60a5fa" class="svg-box" rx="3"/><text x="227" y="82" text-anchor="middle" class="svg-label-sm" fill="#dbeafe" font-size="9">Q2</text>
+  </g>
+
+  <!-- Up-project KV -->
+  <rect x="290" y="175" width="60" height="25" fill="#dc2626" stroke="#f87171" class="svg-box" rx="3"/><text x="320" y="192" text-anchor="middle" class="svg-label-sm" fill="#fee2e2" font-size="9">K (展开)</text>
+  <rect x="290" y="205" width="60" height="25" fill="#059669" stroke="#34d399" class="svg-box" rx="3"/><text x="320" y="222" text-anchor="middle" class="svg-label-sm" fill="#d1fae5" font-size="9">V (展开)</text>
+
+  <!-- RoPE decoupled -->
+  <rect x="290" y="55" width="60" height="30" fill="#8b5cf6" stroke="#a78bfa" class="svg-box" rx="3"/>
+  <text x="320" y="73" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">RoPE Q</text>
+  <rect x="290" y="120" width="60" height="30" fill="#8b5cf6" stroke="#a78bfa" class="svg-box" rx="3"/>
+  <text x="320" y="138" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">RoPE K</text>
+
+  <!-- Attention dot product -->
+  <rect x="400" y="100" width="70" height="50" fill="#334155" stroke="#94a3b8" class="svg-box" rx="5"/>
+  <text x="435" y="120" text-anchor="middle" class="svg-label-sm">QK^T</text>
+  <text x="435" y="138" text-anchor="middle" class="svg-label-sm">softmax</text>
+
+  <!-- Output -->
+  <rect x="520" y="100" width="60" height="50" fill="#7c3aed" stroke="#a78bfa" class="svg-box" rx="4"/>
+  <text x="550" y="130" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">Output</text>
+
+  <!-- Arrows -->
+  <line x1="70" y1="120" x2="110" y2="75" class="svg-arrow"/>
+  <line x1="70" y1="160" x2="110" y2="200" class="svg-arrow"/>
+  <line x1="170" y1="75" x2="210" y2="60" class="svg-arrow"/>
+  <line x1="170" y1="200" x2="200" y2="205" class="svg-arrow"/>
+  <line x1="250" y1="200" x2="290" y2="187" class="svg-arrow"/>
+  <line x1="250" y1="215" x2="290" y2="217" class="svg-arrow"/>
+  <line x1="245" y1="55" x2="290" y2="68" class="svg-arrow"/>
+  <line x1="250" y1="210" x2="290" y2="135" class="svg-arrow" stroke-dasharray="4,2"/>
+  <line x1="350" y1="68" x2="400" y2="115" class="svg-arrow"/>
+  <line x1="350" y1="137" x2="400" y2="125" class="svg-arrow"/>
+  <line x1="350" y1="187" x2="400" y2="130" class="svg-arrow"/>
+  <line x1="350" y1="217" x2="400" y2="140" class="svg-arrow"/>
+  <line x1="470" y1="125" x2="520" y2="125" class="svg-arrow"/>
+
+  <!-- Cache annotation -->
+  <rect x="195" y="240" width="60" height="30" fill="#fbbf24" stroke="#f59e0b" class="svg-box" rx="3" opacity="0.9"/>
+  <text x="225" y="258" text-anchor="middle" class="svg-label-sm" fill="#78350f" font-weight="bold">KV Cache</text>
+  <text x="225" y="275" text-anchor="middle" class="svg-label-sm" font-size="9">仅存 c_KV</text>
+
+  <text x="380" y="270" text-anchor="middle" class="svg-label-sm" font-size="10">KV Cache 仅需存储低秩 latent c_KV，而非完整 K/V</text>
+</svg>
+</div>
+<p class="diagram-caption">MLA：KV Cache 中只存低秩压缩向量 <code>c_KV</code>（kv_lora_rank 维），而非完整多头 K/V，显存大幅下降。Decode 时再 up-project 还原。</p>
+
+<div class="grid2">
+<div class="note">
+<strong>KV Cache 大小对比（seq_len=4096, head_dim=128, 32 头）：</strong>
+<ul>
+<li><strong>MHA:</strong> 4096 × 32 × 128 × 2 ≈ 32 MB / 层</li>
+<li><strong>MQA:</strong> 4096 × 1 × 128 × 2 ≈ 1 MB / 层</li>
+<li><strong>GQA (8 kv头):</strong> 4096 × 8 × 128 × 2 ≈ 8 MB / 层</li>
+<li><strong>MLA (kv_lora=512):</strong> 4096 × 512 × 1 ≈ 2 MB / 层（+ RoPE 部分）</li>
+</ul>
+</div>
+</div>
+</section>
+
+<!-- =================== FlashAttention =================== -->
+<section id="flash">
+<h2>2. FlashAttention 计算流程</h2>
+<p><span class="tag tag-hot">核心</span>FlashAttention 通过 <strong>tiling（分块）</strong> 将 Q、K、V 切成小块，在 SRAM 中完成 attention 计算，避免在 HBM 中物化完整的 N×N attention matrix。</p>
+
+<div class="diagram-wrap">
+<svg viewBox="0 0 700 360" width="700" xmlns="http://www.w3.org/2000/svg">
+  <!-- HBM label -->
+  <text x="350" y="20" text-anchor="middle" class="svg-label-bold">HBM (显存)</text>
+  <line x1="50" y1="28" x2="650" y2="28" stroke="#475569" stroke-width="1" stroke-dasharray="5,3"/>
+
+  <!-- Q matrix -->
+  <rect x="60" y="40" width="100" height="80" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="4"/>
+  <text x="110" y="75" text-anchor="middle" class="svg-label">Q</text>
+  <text x="110" y="92" text-anchor="middle" class="svg-label-sm">[N, d]</text>
+
+  <!-- K matrix -->
+  <rect x="200" y="40" width="100" height="80" fill="#7f1d1d" stroke="#ef4444" class="svg-box" rx="4"/>
+  <text x="250" y="75" text-anchor="middle" class="svg-label">K</text>
+  <text x="250" y="92" text-anchor="middle" class="svg-label-sm">[N, d]</text>
+
+  <!-- V matrix -->
+  <rect x="340" y="40" width="100" height="80" fill="#14532d" stroke="#10b981" class="svg-box" rx="4"/>
+  <text x="390" y="75" text-anchor="middle" class="svg-label">V</text>
+  <text x="390" y="92" text-anchor="middle" class="svg-label-sm">[N, d]</text>
+
+  <!-- Naive S matrix (crossed out) -->
+  <rect x="480" y="35" width="120" height="90" fill="#374151" stroke="#6b7280" class="svg-box" rx="4" opacity="0.4"/>
+  <text x="540" y="72" text-anchor="middle" class="svg-label-sm" fill="#9ca3af">S = QK^T</text>
+  <text x="540" y="88" text-anchor="middle" class="svg-label-sm" fill="#9ca3af">[N, N]</text>
+  <line x1="490" y1="45" x2="590" y2="115" stroke="#ef4444" stroke-width="2"/>
+  <line x1="590" y1="45" x2="490" y2="115" stroke="#ef4444" stroke-width="2"/>
+  <text x="540" y="135" text-anchor="middle" class="svg-label-sm" fill="#ef4444" font-size="10">❌ 避免 N×N 物化</text>
+
+  <!-- Arrow to SRAM -->
+  <line x1="110" y1="125" x2="180" y2="170" class="svg-arrow" stroke="#06b6d4"/>
+  <line x1="250" y1="125" x2="240" y2="170" class="svg-arrow" stroke="#06b6d4"/>
+  <line x1="390" y1="125" x2="300" y2="170" class="svg-arrow" stroke="#06b6d4"/>
+  <text x="200" y="155" text-anchor="middle" class="svg-label-sm" fill="#06b6d4" font-size="10">分块加载 (tile)</text>
+
+  <!-- SRAM label -->
+  <rect x="150" y="160" width="350" height="180" fill="#0e7490" stroke="#06b6d4" stroke-width="2" rx="8" opacity="0.3"/>
+  <text x="325" y="180" text-anchor="middle" class="svg-label-bold" fill="#67e8f9">SRAM (片上缓存)</text>
+
+  <!-- Tile Q_i -->
+  <rect x="170" y="195" width="80" height="40" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/>
+  <text x="210" y="220" text-anchor="middle" class="svg-label-sm">Q_i (tile)</text>
+
+  <!-- Tile K_j -->
+  <rect x="270" y="195" width="80" height="40" fill="#7f1d1d" stroke="#ef4444" class="svg-box" rx="3"/>
+  <text x="310" y="220" text-anchor="middle" class="svg-label-sm">K_j (tile)</text>
+
+  <!-- Tile V_j -->
+  <rect x="370" y="195" width="80" height="40" fill="#14532d" stroke="#10b981" class="svg-box" rx="3"/>
+  <text x="410" y="220" text-anchor="middle" class="svg-label-sm">V_j (tile)</text>
+
+  <!-- Computation -->
+  <rect x="200" y="255" width="220" height="35" fill="#334155" stroke="#94a3b8" class="svg-box" rx="5"/>
+  <text x="310" y="278" text-anchor="middle" class="svg-label-sm">S_ij = Q_i · K_j^T · scale</text>
+
+  <rect x="200" y="295" width="220" height="35" fill="#334155" stroke="#94a3b8" class="svg-box" rx="5"/>
+  <text x="310" y="318" text-anchor="middle" class="svg-label-sm">O_i = online_softmax(S_ij) · V_j</text>
+
+  <!-- arrows -->
+  <line x1="210" y1="235" x2="250" y2="255" class="svg-arrow"/>
+  <line x1="310" y1="235" x2="310" y2="255" class="svg-arrow"/>
+  <line x1="410" y1="235" x2="370" y2="295" class="svg-arrow"/>
+
+  <!-- Output back to HBM -->
+  <line x1="420" y1="313" x2="600" y2="280" class="svg-arrow" stroke="#10b981"/>
+  <rect x="560" y="265" width="90" height="40" fill="#4c1d95" stroke="#a855f7" class="svg-box" rx="4"/>
+  <text x="605" y="285" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">O_i</text>
+  <text x="605" y="298" text-anchor="middle" class="svg-label-sm" fill="#94a3b8" font-size="9">写回 HBM</text>
+</svg>
+</div>
+
+<div class="note">
+<strong>关键点：</strong>FlashAttention 的核心是 <strong>online softmax</strong>（分块 softmax）——在 SRAM 中对每个 tile 计算
+<code>S_ij = Q_i · K_j^T</code> 后立即更新局部最大值与累加和，最终合并得到完整 softmax 结果，无需物化 N×N 矩阵。vLLM 使用 <code>flash_attn_with_kvcache</code> 接口在 decode 时直接传入 page table 进行块状 KV 读取。
+</div>
+</section>
+
+<!-- =================== PagedAttention =================== -->
+<section id="paged">
+<h2>3. PagedAttention 结构与计算逻辑</h2>
+<p><span class="tag tag-core">vLLM 核心</span>PagedAttention 将 KV Cache 组织为固定大小的 block，通过 block table 映射逻辑序列到物理 block，类似操作系统的虚拟内存分页机制。</p>
+
+<div class="diagram-wrap">
+<svg viewBox="0 0 720 420" width="720" xmlns="http://www.w3.org/2000/svg">
+  <!-- Logical sequences -->
+  <text x="30" y="25" class="svg-label-bold">逻辑序列视图</text>
+  
+  <!-- Seq A -->
+  <rect x="30" y="40" width="45" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/><text x="52" y="58" text-anchor="middle" class="svg-label-sm" font-size="9">A1</text>
+  <rect x="75" y="40" width="45" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/><text x="97" y="58" text-anchor="middle" class="svg-label-sm" font-size="9">A2</text>
+  <rect x="120" y="40" width="45" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/><text x="142" y="58" text-anchor="middle" class="svg-label-sm" font-size="9">A3</text>
+  <rect x="165" y="40" width="45" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/><text x="187" y="58" text-anchor="middle" class="svg-label-sm" font-size="9">A4</text>
+  <text x="105" y="85" text-anchor="middle" class="svg-label-sm" fill="#3b82f6">Seq A (逻辑 block 0-3)</text>
+
+  <!-- Seq B -->
+  <rect x="30" y="100" width="45" height="30" fill="#1e3a5f" stroke="#10b981" class="svg-box" rx="3"/><text x="52" y="118" text-anchor="middle" class="svg-label-sm" font-size="9">B1</text>
+  <rect x="75" y="100" width="45" height="30" fill="#1e3a5f" stroke="#10b981" class="svg-box" rx="3"/><text x="97" y="118" text-anchor="middle" class="svg-label-sm" font-size="9">B2</text>
+  <rect x="120" y="100" width="45" height="30" fill="#1e3a5f" stroke="#10b981" class="svg-box" rx="3"/><text x="142" y="118" text-anchor="middle" class="svg-label-sm" font-size="9">B3</text>
+  <text x="97" y="145" text-anchor="middle" class="svg-label-sm" fill="#10b981">Seq B (逻辑 block 0-2)</text>
+
+  <!-- Block Tables -->
+  <text x="280" y="25" class="svg-label-bold">Block Table (映射)</text>
+  
+  <!-- A block table -->
+  <rect x="270" y="40" width="40" height="25" fill="#334155" stroke="#3b82f6" class="svg-box" rx="3"/><text x="290" y="57" text-anchor="middle" class="svg-label-sm" font-size="9">→7</text>
+  <rect x="312" y="40" width="40" height="25" fill="#334155" stroke="#3b82f6" class="svg-box" rx="3"/><text x="332" y="57" text-anchor="middle" class="svg-label-sm" font-size="9">→2</text>
+  <rect x="354" y="40" width="40" height="25" fill="#334155" stroke="#3b82f6" class="svg-box" rx="3"/><text x="374" y="57" text-anchor="middle" class="svg-label-sm" font-size="9">→5</text>
+  <rect x="396" y="40" width="40" height="25" fill="#334155" stroke="#3b82f6" class="svg-box" rx="3"/><text x="416" y="57" text-anchor="middle" class="svg-label-sm" font-size="9">→0</text>
+  <text x="350" y="80" text-anchor="middle" class="svg-label-sm" fill="#3b82f6" font-size="10">A.block_table = [7, 2, 5, 0]</text>
+
+  <!-- B block table -->
+  <rect x="270" y="100" width="40" height="25" fill="#334155" stroke="#10b981" class="svg-box" rx="3"/><text x="290" y="117" text-anchor="middle" class="svg-label-sm" font-size="9">→1</text>
+  <rect x="312" y="100" width="40" height="25" fill="#334155" stroke="#10b981" class="svg-box" rx="3"/><text x="332" y="117" text-anchor="middle" class="svg-label-sm" font-size="9">→5</text>
+  <rect x="354" y="100" width="40" height="25" fill="#334155" stroke="#10b981" class="svg-box" rx="3"/><text x="374" y="117" text-anchor="middle" class="svg-label-sm" font-size="9">→3</text>
+  <text x="330" y="140" text-anchor="middle" class="svg-label-sm" fill="#10b981" font-size="10">B.block_table = [1, 5, 3]</text>
+
+  <!-- Shared block 5 highlighted -->
+  <text x="470" y="80" text-anchor="middle" class="svg-label-sm" fill="#f59e0b" font-size="10">⬆ block 5 被共享</text>
+
+  <!-- Physical blocks -->
+  <text x="520" y="25" class="svg-label-bold">物理 KV Cache Pool</text>
+  <g font-size="9">
+    <!-- block 0 -->
+    <rect x="470" y="180" width="55" height="35" fill="#1e293b" stroke="#3b82f6" class="svg-box" rx="3"/><text x="497" y="195" text-anchor="middle" class="svg-label-sm">block 0</text><text x="497" y="208" text-anchor="middle" class="svg-label-sm" fill="#3b82f6">A4</text>
+    <!-- block 1 -->
+    <rect x="530" y="180" width="55" height="35" fill="#1e293b" stroke="#10b981" class="svg-box" rx="3"/><text x="557" y="195" text-anchor="middle" class="svg-label-sm">block 1</text><text x="557" y="208" text-anchor="middle" class="svg-label-sm" fill="#10b981">B1</text>
+    <!-- block 2 -->
+    <rect x="590" y="180" width="55" height="35" fill="#1e293b" stroke="#3b82f6" class="svg-box" rx="3"/><text x="617" y="195" text-anchor="middle" class="svg-label-sm">block 2</text><text x="617" y="208" text-anchor="middle" class="svg-label-sm" fill="#3b82f6">A2</text>
+    <!-- block 3 -->
+    <rect x="650" y="180" width="55" height="35" fill="#1e293b" stroke="#10b981" class="svg-box" rx="3"/><text x="677" y="195" text-anchor="middle" class="svg-label-sm">block 3</text><text x="677" y="208" text-anchor="middle" class="svg-label-sm" fill="#10b981">B3</text>
+    <!-- block 5 (shared) -->
+    <rect x="530" y="40" width="55" height="35" fill="#78350f" stroke="#f59e0b" class="svg-box" rx="3" stroke-width="3"/><text x="557" y="55" text-anchor="middle" class="svg-label-sm" fill="#fbbf24">block 5</text><text x="557" y="68" text-anchor="middle" class="svg-label-sm" fill="#fbbf24">A3+B2</text>
+    <!-- block 7 -->
+    <rect x="650" y="40" width="55" height="35" fill="#1e293b" stroke="#3b82f6" class="svg-box" rx="3"/><text x="677" y="55" text-anchor="middle" class="svg-label-sm">block 7</text><text x="677" y="68" text-anchor="middle" class="svg-label-sm" fill="#3b82f6">A1</text>
+    <!-- Free blocks -->
+    <rect x="470" y="40" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="497" y="55" text-anchor="middle" class="svg-label-sm" fill="#64748b">free</text>
+    <rect x="590" y="40" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="617" y="55" text-anchor="middle" class="svg-label-sm" fill="#64748b">free</text>
+    <rect x="470" y="100" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="497" y="115" text-anchor="middle" class="svg-label-sm" fill="#64748b">free</text>
+    <rect x="530" y="100" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="557" y="115" text-anchor="middle" class="svg-label-sm" fill="#64748b">free</text>
+    <rect x="590" y="100" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="617" y="115" text-anchor="middle" class="svg-label-sm" fill="#64748b">free</text>
+    <rect x="650" y="100" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="677" y="115" text-anchor="middle" class="svg-label-sm" fill="#64748b">free</text>
+    <rect x="470" y="180" width="55" height="35" fill="#1e293b" stroke="#475569" class="svg-box" rx="3" opacity="0.5"/><text x="497" y="200" text-anchor="middle" class="svg-label-sm" fill="#64748b" font-size="8">free</text>
+  </g>
+
+  <!-- Arrows from block table to physical -->
+  <line x1="290" y1="75" x2="670" y2="55" class="svg-arrow" stroke="#3b82f6" opacity="0.5"/>
+  <line x1="332" y1="75" x2="610" y2="55" class="svg-arrow" stroke="#3b82f6" opacity="0.5"/>
+  <line x1="374" y1="75" x2="550" y2="55" class="svg-arrow" stroke="#3b82f6" opacity="0.5"/>
+  <line x1="416" y1="75" x2="490" y2="175" class="svg-arrow" stroke="#3b82f6" opacity="0.5"/>
+  <line x1="290" y1="130" x2="550" y2="175" class="svg-arrow" stroke="#10b981" opacity="0.5"/>
+  <line x1="332" y1="130" x2="555" y2="55" class="svg-arrow" stroke="#f59e0b" opacity="0.7" stroke-width="2"/>
+  <line x1="374" y1="130" x2="670" y2="175" class="svg-arrow" stroke="#10b981" opacity="0.5"/>
+
+  <!-- Compute logic -->
+  <text x="100" y="260" class="svg-label-bold">Decode 计算 (单个新 token)</text>
+  <rect x="40" y="270" width="45" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/><text x="62" y="288" text-anchor="middle" class="svg-label-sm" font-size="9">q_new</text>
+  
+  <line x1="85" y1="285" x2="120" y2="285" class="svg-arrow"/>
+  
+  <rect x="120" y="265" width="100" height="40" fill="#334155" stroke="#94a3b8" class="svg-box" rx="5"/>
+  <text x="170" y="280" text-anchor="middle" class="svg-label-sm">遍历 block_table</text>
+  <text x="170" y="295" text-anchor="middle" class="svg-label-sm" font-size="9">读取每个物理 block 的 KV</text>
+  
+  <line x1="220" y1="285" x2="255" y2="285" class="svg-arrow"/>
+  
+  <rect x="255" y="265" width="110" height="40" fill="#334155" stroke="#f59e0b" class="svg-box" rx="5"/>
+  <text x="310" y="280" text-anchor="middle" class="svg-label-sm">q · K_block^T</text>
+  <text x="310" y="295" text-anchor="middle" class="svg-label-sm" font-size="9">score (逐 block 累积)</text>
+
+  <line x1="365" y1="285" x2="400" y2="285" class="svg-arrow"/>
+  
+  <rect x="400" y="265" width="110" height="40" fill="#334155" stroke="#a855f7" class="svg-box" rx="5"/>
+  <text x="455" y="280" text-anchor="middle" class="svg-label-sm">softmax(score)</text>
+  <text x="455" y="295" text-anchor="middle" class="svg-label-sm" font-size="9">· V_block</text>
+
+  <line x1="510" y1="285" x2="545" y2="285" class="svg-arrow"/>
+
+  <rect x="545" y="270" width="50" height="30" fill="#4c1d95" stroke="#a855f7" class="svg-box" rx="3"/>
+  <text x="570" y="288" text-anchor="middle" class="svg-label-sm" fill="#ede9fe">out</text>
+
+  <text x="310" y="340" text-anchor="middle" class="svg-label-sm" font-size="10">block_size=16 时，一个 4096 token 序列 = 256 个 block，block_table 长度 256</text>
+  <text x="310" y="355" text-anchor="middle" class="svg-label-sm" font-size="10">Copy-on-Write: 当需要修改共享 block 时，先复制到新 block 再写入</text>
+  <text x="310" y="370" text-anchor="middle" class="svg-label-sm" font-size="10" fill="#f59e0b">↑ block 5 同时属于 Seq A (逻辑3) 和 Seq B (逻辑1) — 前缀共享</text>
+</svg>
+</div>
+</section>
+
+<!-- =================== KV Cache 存储 =================== -->
+<section id="kv">
+<h2>4. KV Cache 存储结构</h2>
+<p>以 block_size=16, num_kv_heads=8, head_size=128 为例，展示 KV Cache 的物理内存布局。</p>
+
+<div class="diagram-wrap">
+<svg viewBox="0 0 720 400" width="720" xmlns="http://www.w3.org/2000/svg">
+  <!-- Title -->
+  <text x="360" y="20" text-anchor="middle" class="svg-label-bold">KV Cache 物理内存布局</text>
+
+  <!-- Key Cache -->
+  <text x="60" y="50" class="svg-label" fill="#ef4444">Key Cache</text>
+  <text x="60" y="65" class="svg-label-sm">shape: [num_blocks, block_size, num_kv_heads, head_size]</text>
+  
+  <!-- Grid of blocks for Key -->
+  <g>
+    <!-- Block 0 -->
+    <rect x="60" y="80" width="200" height="60" fill="#1e293b" stroke="#ef4444" class="svg-box" rx="4"/>
+    <text x="160" y="98" text-anchor="middle" class="svg-label-sm" fill="#f87171">Block 0</text>
+    <!-- slots -->
+    <rect x="68" y="105" width="20" height="25" fill="#7f1d1d" rx="2"/><text x="78" y="121" text-anchor="middle" font-size="7" fill="#fee2e2">s0</text>
+    <rect x="90" y="105" width="20" height="25" fill="#7f1d1d" rx="2"/><text x="100" y="121" text-anchor="middle" font-size="7" fill="#fee2e2">s1</text>
+    <rect x="112" y="105" width="20" height="25" fill="#7f1d1d" rx="2"/><text x="122" y="121" text-anchor="middle" font-size="7" fill="#fee2e2">s2</text>
+    <rect x="134" y="105" width="20" height="25" fill="#374151" rx="2"/><text x="144" y="121" text-anchor="middle" font-size="7" fill="#9ca3af">...</text>
+    <rect x="156" y="105" width="20" height="25" fill="#374151" rx="2"/><text x="166" y="121" text-anchor="middle" font-size="7" fill="#9ca3af">...</text>
+    <rect x="178" y="105" width="20" height="25" fill="#7f1d1d" rx="2"/><text x="188" y="121" text-anchor="middle" font-size="7" fill="#fee2e2">s14</text>
+    <rect x="200" y="105" width="20" height="25" fill="#7f1d1d" rx="2"/><text x="210" y="121" text-anchor="middle" font-size="7" fill="#fee2e2">s15</text>
+    
+    <!-- Block 1 -->
+    <rect x="270" y="80" width="200" height="60" fill="#1e293b" stroke="#ef4444" class="svg-box" rx="4"/>
+    <text x="370" y="98" text-anchor="middle" class="svg-label-sm" fill="#f87171">Block 1</text>
+    <rect x="278" y="105" width="20" height="25" fill="#374151" rx="2"/><text x="288" y="121" text-anchor="middle" font-size="7" fill="#9ca3af">free</text>
+
+    <!-- Block 2 -->
+    <rect x="480" y="80" width="200" height="60" fill="#1e293b" stroke="#ef4444" class="svg-box" rx="4"/>
+    <text x="580" y="98" text-anchor="middle" class="svg-label-sm" fill="#f87171">Block 2</text>
+  </g>
+
+  <text x="360" y="165" text-anchor="middle" class="svg-label-sm" fill="#94a3b8">每个 block_size=16 个 slot, 每个 slot 存 8 头 × 128 维 = 1024 维 Key</text>
+
+  <!-- Value Cache -->
+  <text x="60" y="195" class="svg-label" fill="#10b981">Value Cache</text>
+  <text x="60" y="210" class="svg-label-sm">shape: [num_blocks, block_size, num_kv_heads, head_size]</text>
+  
+  <g>
+    <rect x="60" y="225" width="200" height="60" fill="#1e293b" stroke="#10b981" class="svg-box" rx="4"/>
+    <text x="160" y="243" text-anchor="middle" class="svg-label-sm" fill="#34d399">Block 0</text>
+    <rect x="270" y="225" width="200" height="60" fill="#1e293b" stroke="#10b981" class="svg-box" rx="4"/>
+    <text x="370" y="243" text-anchor="middle" class="svg-label-sm" fill="#34d399">Block 1</text>
+    <rect x="480" y="225" width="200" height="60" fill="#1e293b" stroke="#10b981" class="svg-box" rx="4"/>
+    <text x="580" y="243" text-anchor="middle" class="svg-label-sm" fill="#34d399">Block 2</text>
+  </g>
+
+  <!-- Slot detail -->
+  <text x="60" y="310" class="svg-label-bold">单个 Slot 内部结构 (block_size 中一个 token)</text>
+  <rect x="60" y="320" width="620" height="40" fill="#0f172a" stroke="#475569" stroke-width="1" rx="4"/>
+  
+  <!-- head slots -->
+  <rect x="70" y="328" width="60" height="25" fill="#7f1d1d" rx="3"/><text x="100" y="344" text-anchor="middle" font-size="8" fill="#fee2e2">head 0</text>
+  <rect x="135" y="328" width="60" height="25" fill="#7f1d1d" rx="3"/><text x="165" y="344" text-anchor="middle" font-size="8" fill="#fee2e2">head 1</text>
+  <rect x="200" y="328" width="60" height="25" fill="#7f1d1d" rx="3"/><text x="230" y="344" text-anchor="middle" font-size="8" fill="#fee2e2">head 2</text>
+  <rect x="265" y="328" width="30" height="25" fill="#374151" rx="3"/><text x="280" y="344" text-anchor="middle" font-size="7" fill="#9ca3af">...</text>
+  <rect x="300" y="328" width="60" height="25" fill="#7f1d1d" rx="3"/><text x="330" y="344" text-anchor="middle" font-size="8" fill="#fee2e2">head 7</text>
+  
+  <!-- head detail -->
+  <text x="390" y="345" class="svg-label-sm" font-size="9">每个 head = 128 维 (head_size)</text>
+  <rect x="500" y="328" width="140" height="25" fill="#1e293b" stroke="#475569" rx="3"/>
+  <text x="570" y="344" text-anchor="middle" font-size="8" fill="#94a3b8">[d0, d1, ..., d127]</text>
+
+  <!-- Info -->
+  <text x="60" y="385" class="svg-label-sm" fill="#fbbf24">⚠ vllm-ascend 中可能使用 NZ (5D) 布局: [num_blocks, num_kv_heads, block_size // 16, 16, head_size]</text>
+</svg>
+</div>
+</section>
+
+<!-- =================== Prefix Cache =================== -->
+<section id="prefix">
+<h2>5. Prefix Cache 查询 / 命中 / 加载 / 驱逐逻辑</h2>
+<p><span class="tag tag-hot">核心机制</span>Prefix Cache 复用已计算的 KV Cache。当新请求的 prompt 前缀与已缓存 block 的内容匹配时，直接引用已有物理 block，跳过 prefill 计算。</p>
+
+<h3>5.1 整体流程</h3>
+<div class="diagram-wrap">
+<svg viewBox="0 0 720 480" width="720" xmlns="http://www.w3.org/2000/svg">
+  <!-- Start -->
+  <rect x="290" y="10" width="140" height="35" fill="#1e40af" stroke="#3b82f6" class="svg-box" rx="17"/>
+  <text x="360" y="32" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">新请求到达</text>
+  <line x1="360" y1="45" x2="360" y2="65" class="svg-arrow"/>
+
+  <!-- Step 1: Tokenize & Hash -->
+  <rect x="250" y="65" width="220" height="50" fill="#334155" stroke="#94a3b8" class="svg-box" rx="6"/>
+  <text x="360" y="82" text-anchor="middle" class="svg-label-bold">Step 1: Tokenize + 分块 Hash</text>
+  <text x="360" y="100" text-anchor="middle" class="svg-label-sm" font-size="10">将 prompt 按 block_size 切分, 每块计算 hash(content)</text>
+  <line x1="360" y1="115" x2="360" y2="135" class="svg-arrow"/>
+
+  <!-- Step 2: Lookup -->
+  <rect x="250" y="135" width="220" height="50" fill="#334155" stroke="#94a3b8" class="svg-box" rx="6"/>
+  <text x="360" y="152" text-anchor="middle" class="svg-label-bold">Step 2: 查询 block_hash → cache</text>
+  <text x="360" y="170" text-anchor="middle" class="svg-label-sm" font-size="10">在 prefix_cache 全局表中查找匹配 hash</text>
+  <line x1="360" y1="185" x2="360" y2="205" class="svg-arrow"/>
+
+  <!-- Decision: Hit? -->
+  <polygon points="360,205 440,240 360,275 280,240" fill="#1e40af" stroke="#3b82f6" class="svg-box"/>
+  <text x="360" y="237" text-anchor="middle" class="svg-label-sm" fill="#dbeafe" font-weight="bold">命中?</text>
+
+  <!-- Yes path -->
+  <line x1="280" y1="240" x2="200" y2="240" class="svg-arrow" stroke="#10b981"/>
+  <text x="240" y="232" text-anchor="middle" class="svg-label-sm" fill="#10b981" font-size="10">YES</text>
+
+  <rect x="60" y="210" width="130" height="60" fill="#064e3b" stroke="#10b981" class="svg-box" rx="6"/>
+  <text x="125" y="230" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0" font-weight="bold">Step 3a: 命中加载</text>
+  <text x="125" y="248" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#a7f3d0">引用已有物理 block</text>
+  <text x="125" y="260" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#a7f3d0">ref_count += 1</text>
+
+  <line x1="125" y1="270" x2="125" y2="390" class="svg-arrow" stroke="#10b981"/>
+  <rect x="50" y="390" width="150" height="35" fill="#064e3b" stroke="#10b981" class="svg-box" rx="6"/>
+  <text x="125" y="412" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0">仅 prefill 剩余部分</text>
+
+  <!-- No path -->
+  <line x1="440" y1="240" x2="520" y2="240" class="svg-arrow" stroke="#f59e0b"/>
+  <text x="480" y="232" text-anchor="middle" class="svg-label-sm" fill="#f59e0b" font-size="10">NO</text>
+
+  <rect x="520" y="210" width="160" height="60" fill="#78350f" stroke="#f59e0b" class="svg-box" rx="6"/>
+  <text x="600" y="230" text-anchor="middle" class="svg-label-sm" fill="#fde68a" font-weight="bold">Step 3b: 未命中</text>
+  <text x="600" y="248" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#fde68a">分配新物理 block</text>
+  <text x="600" y="260" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#fde68a">执行完整 prefill</text>
+  <line x1="600" y1="270" x2="600" y2="290" class="svg-arrow"/>
+
+  <!-- Step 4: Store -->
+  <rect x="510" y="290" width="180" height="50" fill="#334155" stroke="#94a3b8" class="svg-box" rx="6"/>
+  <text x="600" y="307" text-anchor="middle" class="svg-label-bold">Step 4: 缓存新 block</text>
+  <text x="600" y="325" text-anchor="middle" class="svg-label-sm" font-size="10">block_hash → physical_block 映射</text>
+  <line x1="600" y1="340" x2="600" y2="360" class="svg-arrow"/>
+
+  <!-- Step 5: Evict check -->
+  <polygon points="600,360 670,390 600,420 530,390" fill="#7c2d12" stroke="#ef4444" class="svg-box"/>
+  <text x="600" y="393" text-anchor="middle" class="svg-label-sm" fill="#fecaca" font-size="10">显存不足?</text>
+  
+  <line x1="530" y1="390" x2="440" y2="390" class="svg-arrow" stroke="#ef4444"/>
+  <text x="485" y="382" text-anchor="middle" class="svg-label-sm" fill="#ef4444" font-size="10">YES</text>
+
+  <!-- Evict -->
+  <rect x="280" y="370" width="150" height="45" fill="#450a0a" stroke="#ef4444" class="svg-box" rx="6"/>
+  <text x="355" y="388" text-anchor="middle" class="svg-label-sm" fill="#fecaca" font-weight="bold">Step 5: 驱逐 LRU block</text>
+  <text x="355" y="403" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#fecaca">ref_count=0 → 释放</text>
+
+  <line x1="355" y1="370" x2="355" y2="350" class="svg-arrow" stroke="#ef4444"/>
+  <text x="365" y="365" class="svg-label-sm" fill="#ef4444" font-size="9">释放后重试分配</text>
+
+  <!-- No evict -->
+  <line x1="670" y1="390" x2="700" y2="390" class="svg-arrow" stroke="#10b981"/>
+  <text x="685" y="382" text-anchor="middle" class="svg-label-sm" fill="#10b981" font-size="9">NO</text>
+  <text x="705" y="395" class="svg-label-sm" fill="#10b981" font-size="9">✓</text>
+
+  <!-- Final -->
+  <line x1="125" y1="425" x2="125" y2="450" class="svg-arrow"/>
+  <line x1="600" y1="425" x2="600" y2="450" class="svg-arrow"/>
+  <rect x="80" y="450" width="130" height="30" fill="#1e40af" stroke="#3b82f6" class="svg-box" rx="6"/>
+  <text x="145" y="470" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">进入 Decode</text>
+  <rect x="535" y="450" width="130" height="30" fill="#1e40af" stroke="#3b82f6" class="svg-box" rx="6"/>
+  <text x="600" y="470" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">进入 Decode</text>
+</svg>
+</div>
+
+<h3>5.2 Prefix Cache 命中场景示例</h3>
+<div class="diagram-wrap">
+<svg viewBox="0 0 720 300" width="720" xmlns="http://www.w3.org/2000/svg">
+  <text x="360" y="20" text-anchor="middle" class="svg-label-bold">Prefix Cache 命中示例</text>
+
+  <!-- Previous request -->
+  <text x="30" y="50" class="svg-label" fill="#94a3b8">请求 1 (已完成, KV 已缓存)</text>
+  <rect x="30" y="60" width="120" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/>
+  <text x="90" y="78" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">"You are a helpful"</text>
+  <rect x="150" y="60" width="120" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/>
+  <text x="210" y="78" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">"AI assistant."</text>
+  <rect x="270" y="60" width="120" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/>
+  <text x="330" y="78" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">"Please answer"</text>
+  <rect x="390" y="60" width="120" height="30" fill="#1e3a5f" stroke="#3b82f6" class="svg-box" rx="3"/>
+  <text x="450" y="78" text-anchor="middle" class="svg-label-sm" fill="#dbeafe">"the question:"</text>
+  
+  <!-- Hash labels -->
+  <text x="90" y="105" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#f59e0b">hash=A1</text>
+  <text x="210" y="105" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#f59e0b">hash=A2</text>
+  <text x="330" y="105" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#f59e0b">hash=A3</text>
+  <text x="450" y="105" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#f59e0b">hash=A4</text>
+
+  <!-- New request -->
+  <text x="30" y="140" class="svg-label" fill="#94a3b8">请求 2 (新到达)</text>
+  <rect x="30" y="150" width="120" height="30" fill="#1e3a5f" stroke="#10b981" class="svg-box" rx="3"/>
+  <text x="90" y="168" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0">"You are a helpful"</text>
+  <rect x="150" y="150" width="120" height="30" fill="#1e3a5f" stroke="#10b981" class="svg-box" rx="3"/>
+  <text x="210" y="168" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0">"AI assistant."</text>
+  <rect x="270" y="150" width="120" height="30" fill="#1e3a5f" stroke="#10b981" class="svg-box" rx="3"/>
+  <text x="330" y="168" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0">"Please answer"</text>
+  <rect x="390" y="150" width="120" height="30" fill="#374151" stroke="#6b7280" class="svg-box" rx="3" stroke-dasharray="5,3"/>
+  <text x="450" y="168" text-anchor="middle" class="svg-label-sm" fill="#9ca3af">"the following:"</text>
+  <rect x="510" y="150" width="120" height="30" fill="#374151" stroke="#6b7280" class="svg-box" rx="3" stroke-dasharray="5,3"/>
+  <text x="570" y="168" text-anchor="middle" class="svg-label-sm" fill="#9ca3af">"What is vLLM?"</text>
+
+  <!-- hash comparison -->
+  <text x="90" y="200" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#10b981">hash=A1 ✓</text>
+  <text x="210" y="200" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#10b981">hash=A2 ✓</text>
+  <text x="330" y="200" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#10b981">hash=A3 ✓</text>
+  <text x="450" y="200" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#ef4444">hash=B4 ✗</text>
+  <text x="570" y="200" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#94a3b8">hash=B5 (new)</text>
+
+  <!-- Result -->
+  <rect x="30" y="220" width="360" height="35" fill="#064e3b" stroke="#10b981" class="svg-box" rx="6"/>
+  <text x="210" y="242" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0">✅ 3 个 block 命中! 直接引用物理 block, 跳过 prefill</text>
+
+  <rect x="390" y="220" width="240" height="35" fill="#78350f" stroke="#f59e0b" class="svg-box" rx="6"/>
+  <text x="510" y="242" text-anchor="middle" class="svg-label-sm" fill="#fde68a">⚠ 2 个 block 需重新 prefill 计算</text>
+
+  <!-- ref count -->
+  <text x="210" y="275" text-anchor="middle" class="svg-label-sm" font-size="10" fill="#f59e0b">共享 block 的 ref_count 增加 → 不会被 LRU 驱逐</text>
+</svg>
+</div>
+
+<h3>5.3 驱逐 (Eviction) 逻辑详解</h3>
+<div class="diagram-wrap">
+<svg viewBox="0 0 720 340" width="720" xmlns="http://www.w3.org/2000/svg">
+  <text x="360" y="20" text-anchor="middle" class="svg-label-bold">LRU 驱逐流程</text>
+
+  <!-- Free block list -->
+  <rect x="20" y="40" width="180" height="280" fill="#0f172a" stroke="#475569" rx="6"/>
+  <text x="110" y="60" text-anchor="middle" class="svg-label-bold" fill="#94a3b8">Free Block List</text>
+  <rect x="40" y="75" width="140" height="25" fill="#1e293b" stroke="#475569" rx="3"/><text x="110" y="92" text-anchor="middle" class="svg-label-sm" fill="#64748b">block #8 (free)</text>
+  <rect x="40" y="105" width="140" height="25" fill="#1e293b" stroke="#475569" rx="3"/><text x="110" y="122" text-anchor="middle" class="svg-label-sm" fill="#64748b">block #12 (free)</text>
+  <text x="110" y="145" text-anchor="middle" class="svg-label-sm" fill="#64748b" font-size="10">↓ LRU 排序 (最近最少使用)</text>
+
+  <!-- Cached blocks with ref counts -->
+  <rect x="240" y="40" width="460" height="280" fill="#0f172a" stroke="#475569" rx="6"/>
+  <text x="470" y="60" text-anchor="middle" class="svg-label-bold" fill="#94a3b8">Cached Blocks (使用中)</text>
+
+  <!-- block with ref=0 (evictable) -->
+  <rect x="260" y="75" width="120" height="40" fill="#450a0a" stroke="#ef4444" class="svg-box" rx="4"/>
+  <text x="320" y="90" text-anchor="middle" class="svg-label-sm" fill="#fecaca">block #3</text>
+  <text x="320" y="105" text-anchor="middle" class="svg-label-sm" fill="#ef4444" font-size="9">ref_count=0</text>
+  <text x="320" y="125" text-anchor="middle" class="svg-label-sm" fill="#ef4444" font-size="9">↑ 可驱逐</text>
+
+  <!-- block with ref=1 -->
+  <rect x="400" y="75" width="120" height="40" fill="#1e293b" stroke="#f59e0b" class="svg-box" rx="4"/>
+  <text x="460" y="90" text-anchor="middle" class="svg-label-sm" fill="#fde68a">block #7</text>
+  <text x="460" y="105" text-anchor="middle" class="svg-label-sm" fill="#f59e0b" font-size="9">ref_count=1</text>
+  <text x="460" y="125" text-anchor="middle" class="svg-label-sm" fill="#fde68a" font-size="9">↑ 引用中</text>
+
+  <!-- block with ref=2 (shared) -->
+  <rect x="540" y="75" width="120" height="40" fill="#064e3b" stroke="#10b981" class="svg-box" rx="4"/>
+  <text x="600" y="90" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0">block #5</text>
+  <text x="600" y="105" text-anchor="middle" class="svg-label-sm" fill="#10b981" font-size="9">ref_count=2</text>
+  <text x="600" y="125" text-anchor="middle" class="svg-label-sm" fill="#a7f3d0" font-size="9">↑ 多请求共享</text>
+
+  <!-- Evict arrow -->
+  <line x1="260" y1="150" x2="180" y2="150" class="svg-arrow" stroke="#ef4444" stroke-width="2"/>
+  <text x="220" y="145" text-anchor="middle" class="svg-label-sm" fill="#ef4444" font-size="10">驱逐</text>
+
+  <!-- Eviction steps -->
+  <text x="260" y="175" class="svg-label-bold" fill="#ef4444">驱逐步骤:</text>
+  <text x="270" y="195" class="svg-label-sm">1. 找到 ref_count=0 且 LRU 最久的 block</text>
+  <text x="270" y="215" class="svg-label-sm">2. 从 prefix_cache 表中删除其 hash 映射</text>
+  <text x="270" y="235" class="svg-label-sm">3. 将物理 block 标记为 free, 加入 free_list</text>
+  <text x="270" y="255" class="svg-label-sm">4. 新请求可分配该 block</text>
+
+  <rect x="260" y="270" width="400" height="35" fill="#334155" stroke="#94a3b8" class="svg-box" rx="6"/>
+  <text x="460" y="290" text-anchor="middle" class="svg-label-sm" fill="#e2e8f0">⚠ ref_count > 0 的 block 永远不会被驱逐 (即使 LRU 最久)</text>
+</svg>
+</div>
+
+<div class="note">
+<strong>vllm-ascend 中的对应状态：</strong>
+<ul>
+<li><code>PrefillCacheHit</code> — 前缀命中，复用已有 block，仅计算剩余 token</li>
+<li><code>PrefillNoCache</code> — 无命中或纯新 prompt，全量 prefill</li>
+<li><code>DecodeOnly</code> — Decode 阶段，每个请求 1 个 token</li>
+<li>Block manager 在 <code>allocate_slots()</code> 中先查 prefix cache，命中则 <code>ref_count += 1</code></li>
+<li>请求完成后 <code>free()</code> 将 <code>ref_count -= 1</code>，降为 0 时加入 LRU evictable 队列</li>
+</ul>
+</div>
+</section>
+
+<!-- =================== 全生命周期 =================== -->
+<section id="lifecycle">
+<h2>6. KV Cache 与 Prefix Cache 全生命周期</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 720 420" width="720" xmlns="http://www.w3.org/2000/svg">
+  <text x="360" y="20" text-anchor="middle" class="svg-label-bold">KV Cache Block 全生命周期</text>
+
+  <!-- Timeline -->
+  <line x1="60" y1="200" x2="660" y2="200" stroke="#475569" stroke-width="3"/>
+  <text x="60" y="195" text-anchor="middle" class="svg-label-sm" fill="#94a3b8">t=0</text>
+  <text x="660" y="195" text-anchor="middle" class="svg-label-sm" fill="#94a3b8">t=N</text>
+
+  <!-- State 1: Free -->
+  <circle cx="120" cy="200" r="12" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <text x="120" y="180" text-anchor="middle" class="svg-label-sm" fill="#64748b">Free</text>
+  <text x="120" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#64748b">空闲池</text>
+
+  <line x1="135" y1="200" x2="195" y2="200" class="svg-arrow"/>
+
+  <!-- State 2: Allocated & Computing -->
+  <circle cx="210" cy="200" r="12" fill="#78350f" stroke="#f59e0b" stroke-width="2"/>
+  <text x="210" y="180" text-anchor="middle" class="svg-label-sm" fill="#fde68a">Prefill</text>
+  <text x="210" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#fde68a">计算 KV 并写入</text>
+
+  <line x1="225" y1="200" x2="285" y2="200" class="svg-arrow"/>
+
+  <!-- State 3: Cached (ref=1) -->
+  <circle cx="300" cy="200" r="12" fill="#1e3a5f" stroke="#3b82f6" stroke-width="2"/>
+  <text x="300" y="180" text-anchor="middle" class="svg-label-sm" fill="#93c5fd">Cached (ref=1)</text>
+  <text x="300" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#93c5fd">请求使用中 + 缓存</text>
+
+  <line x1="315" y1="200" x2="375" y2="200" class="svg-arrow" stroke="#10b981"/>
+  <text x="345" y="192" text-anchor="middle" class="svg-label-sm" fill="#10b981" font-size="9">新请求命中</text>
+
+  <!-- State 4: Shared (ref=2) -->
+  <circle cx="390" cy="200" r="14" fill="#064e3b" stroke="#10b981" stroke-width="2"/>
+  <text x="390" y="180" text-anchor="middle" class="svg-label-sm" fill="#6ee7b7">Shared (ref=2)</text>
+  <text x="390" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#6ee7b7">多请求共享</text>
+
+  <line x1="405" y1="200" x2="465" y2="200" class="svg-arrow"/>
+
+  <!-- State 5: Cached (ref=1, LRU aged) -->
+  <circle cx="480" cy="200" r="12" fill="#1e3a5f" stroke="#3b82f6" stroke-width="2" opacity="0.6"/>
+  <text x="480" y="180" text-anchor="middle" class="svg-label-sm" fill="#93c5fd">Cached (ref=1)</text>
+  <text x="480" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#64748b">请求完成, ref=1→0</text>
+
+  <line x1="495" y1="200" x2="555" y2="200" class="svg-arrow"/>
+
+  <!-- State 6: Evictable (ref=0) -->
+  <circle cx="570" cy="200" r="12" fill="#450a0a" stroke="#ef4444" stroke-width="2"/>
+  <text x="570" y="180" text-anchor="middle" class="svg-label-sm" fill="#fca5a5">Evictable</text>
+  <text x="570" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#fca5a5">ref=0, LRU 等待</text>
+
+  <line x1="585" y1="200" x2="625" y2="200" class="svg-arrow" stroke="#ef4444"/>
+
+  <!-- State 7: Freed -->
+  <circle cx="640" cy="200" r="12" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <text x="640" y="180" text-anchor="middle" class="svg-label-sm" fill="#64748b">Freed</text>
+  <text x="640" y="230" text-anchor="middle" class="svg-label-sm" font-size="9" fill="#64748b">回收或驱逐</text>
+
+  <!-- top annotations -->
+  <rect x="60" y="50" width="600" height="100" fill="#0f172a" stroke="#475569" rx="6"/>
+  <text x="80" y="72" class="svg-label-bold" fill="#06b6d4">关键操作</text>
+  <text x="80" y="92" class="svg-label-sm" fill="#e2e8f0">① allocate: 从 free_list 取 block → 计算并写入 KV</text>
+  <text x="80" y="110" class="svg-label-sm" fill="#e2e8f0">② cache_store: prefill 完成后, 将 block_hash → physical_block 存入全局表</text>
+  <text x="80" y="128" class="svg-label-sm" fill="#e2e8f0">③ cache_lookup: 新请求 prompt 分块 hash 查表, 命中则 ref_count += 1</text>
+  <text x="80" y="146" class="svg-label-sm" fill="#e2e8f0">④ free: 请求结束 ref_count -= 1; 若 ref_count == 0 则进入 LRU evictable</text>
+
+  <!-- bottom annotations -->
+  <rect x="60" y="260" width="600" height="140" fill="#0f172a" stroke="#475569" rx="6"/>
+  <text x="80" y="282" class="svg-label-bold" fill="#f59e0b">驱逐策略 (LRU)</text>
+  <text x="80" y="302" class="svg-label-sm" fill="#e2e8f0">• 当 free_list 为空且需要新 block 时, 从 evictable 队列取 LRU 最久的 block</text>
+  <text x="80" y="320" class="svg-label-sm" fill="#e2e8f0">• 驱逐前检查 ref_count == 0 (确保没有请求正在使用)</text>
+  <text x="80" y="338" class="svg-label-sm" fill="#e2e8f0">• 驱逐 = 从 cache 表删除 hash 映射 + block 回收进 free_list</text>
+  <text x="80" y="358" class="svg-label-sm" fill="#e2e8f0">• Copy-on-Write: 若共享 block 需要被修改(如序列继续生成), 先复制再写入</text>
+  <text x="80" y="378" class="svg-label-sm" fill="#e2e8f0">• vllm-ascend FIA 路径在 PrefillCacheHit 状态下直接复用 block_table, 跳过重复计算</text>
+</svg>
+</div>
+</section>
+
+</main>
+
+<footer>
+<p>vLLM Attention 结构图解 · KV Cache / Prefix Cache 逻辑全景 · Generated by TRAE</p>
+</footer>
+
+</body>
+</html>
