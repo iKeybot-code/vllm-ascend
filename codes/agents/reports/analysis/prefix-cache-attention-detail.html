@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prefix Cache · 不同 Attention 的命中/存储/查询/驱逐逻辑</title>
+<style>
+  :root {
+    --font-sans: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --surface: #ffffff;
+    --surface-muted: #f5f6f8;
+    --surface-soft: #eceef1;
+    --border: #d8dce3;
+    --border-soft: #e6e8ec;
+    --brand: #5b2dd9;
+    --brand-soft: #efe9ff;
+    --brand-border: #c9b8ff;
+    --accent: #14a07b;
+    --accent-soft: #e2f6ee;
+    --accent-border: #a8e0c9;
+    --warn: #d97706;
+    --warn-soft: #fef3e2;
+    --warn-border: #fcd9a6;
+    --ink: #2b2f3a;
+    --muted: #6b7280;
+    --radius: 8px;
+    --radius-card: 12px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #1c1d22; --surface-muted: #24262b; --surface-soft: #2c2e35;
+      --border: #3a3d46; --border-soft: #323439;
+      --brand-soft: #2a1d4a; --brand-border: #4a3a7a;
+      --accent-soft: #133b2e; --accent-border: #2a6e57;
+      --warn-soft: #3d2e10; --warn-border: #6b4a1a;
+      --ink: #e6e7ea; --muted: #9aa0ac;
+      --shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/22px var(--font-sans); color:var(--ink); background:var(--surface-muted); padding:24px; }
+  .host { max-width:1200px; margin:0 auto; background:var(--surface); padding:32px; border-radius:16px; display:flex; flex-direction:column; gap:28px; box-shadow:var(--shadow); }
+  h1 { font-size:24px; font-weight:700; color:var(--brand); margin:0; letter-spacing:-0.01em; }
+  h2 { font-size:20px; font-weight:700; color:var(--brand); margin:0; letter-spacing:-0.01em; }
+  h3 { font-size:16px; font-weight:600; margin:0; }
+  h4 { font-size:14px; font-weight:600; margin:0; color:var(--ink); }
+  .sub { color:var(--muted); font-size:13px; margin:4px 0 0; }
+  .section { display:flex; flex-direction:column; gap:16px; }
+  .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-card); padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:10px; }
+  .card.brand { border-color:var(--brand-border); }
+  .card.accent { border-color:var(--accent-border); }
+  .card.warn { border-color:var(--warn-border); }
+  .badge { font-size:11px; padding:2px 10px; border-radius:999px; white-space:nowrap; display:inline-block; }
+  .badge.up { background:var(--surface-soft); color:var(--muted); border:1px solid var(--border-soft); }
+  .badge.asc { background:var(--brand-soft); color:var(--brand); border:1px solid var(--brand-border); }
+  .badge.cu { background:var(--accent-soft); color:var(--accent); border:1px solid var(--accent-border); }
+  .badge.wa { background:var(--warn-soft); color:var(--warn); border:1px solid var(--warn-border); }
+  .svg-wrap { background:var(--surface-muted); border:1px solid var(--border); border-radius:var(--radius-card); padding:16px; overflow-x:auto; }
+  .svg-wrap svg { display:block; width:100%; height:auto; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border-soft); vertical-align:top; }
+  th { font-weight:600; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; background:var(--surface-muted); }
+  tr:last-child td { border-bottom:none; }
+  code { font-family:var(--font-mono); font-size:12px; background:var(--surface-soft); padding:1px 6px; border-radius:4px; }
+  .legend { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; color:var(--muted); }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:middle; }
+  .step { display:flex; gap:12px; align-items:flex-start; }
+  .step .num { font-weight:700; font-size:12px; width:24px; height:24px; display:flex; align-items:center; justify-content:center; background:var(--brand-soft); color:var(--brand); border-radius:50%; border:1px solid var(--brand-border); flex-shrink:0; }
+  .step .body { flex:1; }
+  .flow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; }
+  .flow .node { padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface); }
+  .flow .node.brand { border-color:var(--brand-border); background:var(--brand-soft); color:var(--brand); }
+  .flow .node.accent { border-color:var(--accent-border); background:var(--accent-soft); color:var(--accent); }
+  .flow .arr { color:var(--muted); }
+  @media (max-width:900px) { .grid-2,.grid-3 { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="host">
+
+<!-- ===== 标题 ===== -->
+<div class="section">
+  <h1>Prefix Cache · 不同 Attention 类型的命中 / 存储 / 查询 / 驱逐逻辑</h1>
+  <p class="sub">vLLM Ascend · 2026-08-19 · 基于代码版本 2d75463</p>
+</div>
+
+<!-- ===== 模块 1: Spec → Manager 映射总表 ===== -->
+<div class="section">
+  <h2>① Spec → Manager 映射总表</h2>
+  <div class="svg-wrap" style="padding:0; overflow-x:auto;">
+    <table>
+      <thead><tr>
+        <th style="width:14%">Attention 类型</th>
+        <th style="width:14%">Spec 类</th>
+        <th style="width:14%">Manager 类</th>
+        <th style="width:8%">来源</th>
+        <th style="width:12%">effective_block_size</th>
+        <th style="width:12%">逻辑块大小</th>
+        <th style="width:26%">关键属性</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Full Attention</strong></td>
+          <td><code>FullAttentionSpec</code></td>
+          <td><code>FullAttentionManager</code></td>
+          <td><span class="badge up">上游</span></td>
+          <td>block_size × DCP</td>
+          <td>= effective</td>
+          <td>标准密集注意力，无压缩</td>
+        </tr>
+        <tr>
+          <td><strong>压缩 MLA</strong></td>
+          <td><code>AscendMLAAttentionSpec</code></td>
+          <td><code>CompressAttentionManager</code></td>
+          <td><span class="badge asc">Ascend 继承</span></td>
+          <td>block_size × DCP × compress_ratio</td>
+          <td><strong>block_size × compress_ratio</strong></td>
+          <td>compress_ratio=4/128, scale_dim, cache_sparse_sfa_c8</td>
+        </tr>
+        <tr>
+          <td><strong>Sliding Window</strong></td>
+          <td><code>SlidingWindowSpec</code></td>
+          <td><code>SlidingWindowManager</code></td>
+          <td><span class="badge up">上游</span></td>
+          <td>block_size × DCP</td>
+          <td>= effective</td>
+          <td>sliding_window, 不可达 block 用 null_block</td>
+        </tr>
+        <tr>
+          <td><strong>Sliding Window MLA</strong></td>
+          <td><code>AscendSlidingWindowMLASpec</code></td>
+          <td><code>SlidingWindowManager</code></td>
+          <td><span class="badge asc">Ascend 自定义 Spec</span></td>
+          <td>block_size × DCP</td>
+          <td>= effective</td>
+          <td>compress_ratio, model_version="deepseek_v4"</td>
+        </tr>
+        <tr>
+          <td><strong>Mamba (SSM)</strong></td>
+          <td><code>MambaSpec</code></td>
+          <td><code>AscendMambaManager</code></td>
+          <td><span class="badge asc">Ascend Patch</span></td>
+          <td>block_size (不乘 DCP)</td>
+          <td>= block_size</td>
+          <td>mamba_cache_mode, 状态空间模型无链式哈希</td>
+        </tr>
+        <tr>
+          <td><strong>SFA Indexer</strong></td>
+          <td><code>AscendSFAIndexerCacheSpec</code></td>
+          <td><code>FullAttentionManager</code></td>
+          <td><span class="badge cu">Ascend 自定义</span></td>
+          <td>block_size × DCP</td>
+          <td>= effective</td>
+          <td>scale_dim, cache_sparse_li_c8, sfa_dcp_replicated_indexer_size</td>
+        </tr>
+        <tr>
+          <td><strong>Chunked Local</strong></td>
+          <td><code>ChunkedLocalAttentionSpec</code></td>
+          <td><code>SlidingWindowManager</code></td>
+          <td><span class="badge up">上游</span></td>
+          <td>block_size × DCP</td>
+          <td>= effective</td>
+          <td>类似 Sliding Window，带 admission cap</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== 模块 2: 各 Manager 的 find_longest_cache_hit 逻辑 ===== -->
+<div class="section">
+  <h2>② 各 Manager 的 find_longest_cache_hit 逐行逻辑</h2>
+
+  <!-- FullAttentionManager -->
+  <div class="card">
+    <h3>FullAttentionManager (上游) <span class="badge up">上游复用</span></h3>
+    <div class="grid-2">
+      <div>
+        <h4>查找逻辑</h4>
+        <div class="step"><span class="num">1</span><div class="body"><code>block_size = spec.block_size</code>，若 DCP>1 则 <code>block_size *= dcp_world_size</code></div></div>
+        <div class="step"><span class="num">2</span><div class="body"><code>max_num_blocks = max_length // block_size</code></div></div>
+        <div class="step"><span class="num">3</span><div class="body">遍历 <code>block_hashes[:max_num_blocks]</code>（链式哈希）</div></div>
+        <div class="step"><span class="num">4</span><div class="body">每个 hash 调用 <code>block_pool.get_cached_block(hash, group_ids)</code></div></div>
+        <div class="step"><span class="num">5</span><div class="body">命中 → <code>computed.append(cached_block)</code>，继续下一个</div></div>
+        <div class="step"><span class="num">6</span><div class="body"><strong>未命中 → break</strong>（链式哈希保证后续必不命中）</div></div>
+        <div class="step"><span class="num">7</span><div class="body">EAGLE: <code>computed.pop()</code> 丢弃最后一个 block</div></div>
+        <div class="step"><span class="num">8</span><div class="body">alignment 截断: 确保 <code>len × block_size % alignment == 0</code></div></div>
+      </div>
+      <div>
+        <h4>特点</h4>
+        <ul style="margin:0; padding-left:16px; font-size:13px;">
+          <li><strong>物理块级查找</strong>：每个 hash 对应一个物理 block</li>
+          <li><strong>向下闭包</strong>：命中 N 个 block → 前 N-1 个必也命中</li>
+          <li>Coordinator 利用此特性：首次查完后后续迭代仅截断，不重新查</li>
+          <li>无需逻辑块聚合</li>
+        </ul>
+        <div class="svg-wrap" style="margin-top:8px;">
+          <svg viewBox="0 0 380 120" width="100%">
+            <rect x="10" y="20" width="50" height="30" rx="6" fill="#e2f6ee" stroke="#a8e0c9"/>
+            <text x="35" y="38" text-anchor="middle" font-size="10" fill="#14a07b">hit</text>
+            <rect x="65" y="20" width="50" height="30" rx="6" fill="#e2f6ee" stroke="#a8e0c9"/>
+            <text x="90" y="38" text-anchor="middle" font-size="10" fill="#14a07b">hit</text>
+            <rect x="120" y="20" width="50" height="30" rx="6" fill="#e2f6ee" stroke="#a8e0c9"/>
+            <text x="145" y="38" text-anchor="middle" font-size="10" fill="#14a07b">hit</text>
+            <rect x="175" y="20" width="50" height="30" rx="6" fill="#fef3e2" stroke="#fcd9a6"/>
+            <text x="200" y="38" text-anchor="middle" font-size="10" fill="#d97706">miss</text>
+            <rect x="230" y="20" width="50" height="30" rx="6" fill="#f5f6f8" stroke="#d8dce3" stroke-dasharray="3 2"/>
+            <text x="255" y="38" text-anchor="middle" font-size="10" fill="#9aa0ac">skip</text>
+            <rect x="285" y="20" width="50" height="30" rx="6" fill="#f5f6f8" stroke="#d8dce3" stroke-dasharray="3 2"/>
+            <text x="310" y="38" text-anchor="middle" font-size="10" fill="#9aa0ac">skip</text>
+            <text x="35" y="68" text-anchor="middle" font-size="9" fill="#6b7280">h0</text>
+            <text x="90" y="68" text-anchor="middle" font-size="9" fill="#6b7280">h1</text>
+            <text x="145" y="68" text-anchor="middle" font-size="9" fill="#6b7280">h2</text>
+            <text x="200" y="68" text-anchor="middle" font-size="9" fill="#6b7280">h3</text>
+            <text x="255" y="68" text-anchor="middle" font-size="9" fill="#9aa0ac">h4</text>
+            <text x="310" y="68" text-anchor="middle" font-size="9" fill="#9aa0ac">h5</text>
+            <line x1="200" y1="55" x2="255" y2="80" stroke="#d97706" stroke-width="1.5" stroke-dasharray="3 2"/>
+            <text x="190" y="100" font-size="10" fill="#d97706">break! 链式保证 h4,h5 必不命中</text>
+            <text x="80" y="100" font-size="10" fill="#14a07b">hit_length = 3 × block_size</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CompressAttentionManager -->
+  <div class="card brand">
+    <h3>CompressAttentionManager (Ascend 继承) <span class="badge asc">继承 FullAttentionManager</span></h3>
+    <div class="grid-2">
+      <div>
+        <h4>查找逻辑</h4>
+        <div class="step"><span class="num">1</span><div class="body"><code>block_size = spec.block_size</code>，若 DCP>1 则 <code>×= dcp</code></div></div>
+        <div class="step"><span class="num">2</span><div class="body"><strong>★ 关键差异：</strong><code>logical_block_size = block_size × compress_ratio</code></div></div>
+        <div class="step"><span class="num">3</span><div class="body"><strong>★ BlockHashListWithBlockSize</strong>：把物理级 hash_block_size 的哈希聚合为按 logical_block_size 的迭代器</div></div>
+        <div class="step"><span class="num">4</span><div class="body"><code>max_num_blocks = max_length // logical_block_size</code></div></div>
+        <div class="step"><span class="num">5</span><div class="body">遍历 <code>logical_block_hashes[:max_num_blocks]</code></div></div>
+        <div class="step"><span class="num">6</span><div class="body">每个逻辑块 hash → <code>block_pool.get_cached_block()</code></div></div>
+        <div class="step"><span class="num">7</span><div class="body">命中 → append，未命中 → break</div></div>
+        <div class="step"><span class="num">8</span><div class="body">EAGLE pop + alignment 截断（同上游）</div></div>
+      </div>
+      <div>
+        <h4>为什么用逻辑块？</h4>
+        <p style="font-size:13px; margin:0;">压缩 MLA 的 KV 以 <strong>block_size × compress_ratio</strong> 为单位存储和共享。若按物理 block_size 查找，一个逻辑块内的部分修改不会被检测到，导致<strong>误命中</strong>。</p>
+        <div class="svg-wrap" style="margin-top:8px;">
+          <svg viewBox="0 0 380 140" width="100%">
+            <text x="10" y="16" font-size="10" fill="#6b7280">物理块 (hash_block_size=128):</text>
+            <rect x="10" y="24" width="40" height="22" rx="4" fill="#efe9ff" stroke="#c9b8ff"/>
+            <text x="30" y="38" text-anchor="middle" font-size="8" fill="#5b2dd9">p0</text>
+            <rect x="52" y="24" width="40" height="22" rx="4" fill="#efe9ff" stroke="#c9b8ff"/>
+            <text x="72" y="38" text-anchor="middle" font-size="8" fill="#5b2dd9">p1</text>
+            <rect x="94" y="24" width="40" height="22" rx="4" fill="#efe9ff" stroke="#c9b8ff"/>
+            <text x="114" y="38" text-anchor="middle" font-size="8" fill="#5b2dd9">p2</text>
+            <rect x="136" y="24" width="40" height="22" rx="4" fill="#efe9ff" stroke="#c9b8ff"/>
+            <text x="156" y="38" text-anchor="middle" font-size="8" fill="#5b2dd9">p3</text>
+            <text x="10" y="64" font-size="10" fill="#5b2dd9">逻辑块 (compress_ratio=4, 128×4=512):</text>
+            <rect x="10" y="72" width="166" height="28" rx="6" fill="#e2f6ee" stroke="#a8e0c9"/>
+            <text x="93" y="90" text-anchor="middle" font-size="10" fill="#14a07b">逻辑块 L0 = hash(p0,p1,p2,p3)</text>
+            <text x="10" y="120" font-size="10" fill="#6b7280">请求 B 修改了 p1 中 1 个 token：</text>
+            <text x="10" y="134" font-size="10" fill="#d97706">→ L0' ≠ L0 → 逻辑块 0 不命中 ✅（不会误共享）</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SlidingWindowManager -->
+  <div class="card">
+    <h3>SlidingWindowManager (上游) <span class="badge up">上游复用</span></h3>
+    <div class="grid-2">
+      <div>
+        <h4>查找逻辑</h4>
+        <div class="step"><span class="num">1</span><div class="body">同 FullAttention：链式 <code>get_cached_block</code> 查找</div></div>
+        <div class="step"><span class="num">2</span><div class="body"><strong>★ 差异：null_block 占位</strong> — 前面不可达的 block（超出 sliding_window 范围）用 <code>null_block</code> 填充</div></div>
+        <div class="step"><span class="num">3</span><div class="body"><code>get_num_skipped_tokens()</code> 计算被跳过的 token 数</div></div>
+        <div class="step"><span class="num">4</span><div class="body">block 回收：超出窗口的旧 block 可被释放复用</div></div>
+      </div>
+      <div>
+        <h4>特点</h4>
+        <ul style="margin:0; padding-left:16px; font-size:13px;">
+          <li>只缓存窗口内可达的 block</li>
+          <li>不可达 block → <code>null_block</code> 占位（block_id=-1）</li>
+          <li>slot_mapping 对 null_block 返回 PAD_SLOT_ID</li>
+          <li>Admission cap: 限制每请求最大 block 数</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- AscendMambaManager -->
+  <div class="card brand">
+    <h3>AscendMambaManager (Ascend Patch) <span class="badge asc">Patch MambaManager</span></h3>
+    <div class="grid-2">
+      <div>
+        <h4>查找逻辑</h4>
+        <div class="step"><span class="num">1</span><div class="body"><code>find_longest_cache_hit</code>：<strong>直接委托父类</strong> MambaManager</div></div>
+        <div class="step"><span class="num">2</span><div class="body">Mamba 是状态空间模型，KV cache 是递推状态，非链式哈希</div></div>
+        <div class="step"><span class="num">3</span><div class="body"><strong>★ Patch 修改点</strong>：<code>get_num_blocks_to_allocate</code> 补 +1 block</div></div>
+        <div class="step"><span class="num">4</span><div class="body">修复外部 KV cache 同步加载时少分配 1 个 block 的 bug</div></div>
+      </div>
+      <div>
+        <h4>特点</h4>
+        <ul style="margin:0; padding-left:16px; font-size:13px;">
+          <li>Mamba block_size 不乘 DCP（状态不分片）</li>
+          <li>enable_partial_hash_hits: block_size > hash_block_size 时启用</li>
+          <li>mamba_cache_mode = "align" 时对齐到 hash_block_size</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 模块 3: cache_blocks 写入逻辑 ===== -->
+<div class="section">
+  <h2>③ cache_blocks · 写入 Prefix Cache 全局索引</h2>
+  <div class="card accent">
+    <h3>写入时机：Scheduler.update_from_output() 中调用 <span class="badge cu">关键写入点</span></h3>
+    <div class="grid-2">
+      <div>
+        <h4>FullAttentionManager.cache_blocks (上游)</h4>
+        <div class="step"><span class="num">1</span><div class="body"><code>num_full_blocks = num_tokens // block_size</code></div></div>
+        <div class="step"><span class="num">2</span><div class="body">跳过已缓存：<code>if num_cached_blocks >= num_full_blocks: return</code></div></div>
+        <div class="step"><span class="num">3</span><div class="body"><code>block_pool.cache_full_blocks(request, blocks, num_cached, num_full, block_size)</code></div></div>
+      </div>
+      <div>
+        <h4>CompressAttentionManager.cache_blocks (Ascend) <span class="badge asc">差异</span></h4>
+        <div class="step"><span class="num">1</span><div class="body"><strong>★ num_full_blocks = num_tokens // (block_size × compress_ratio)</strong></div></div>
+        <div class="step"><span class="num">2</span><div class="body">只缓存<strong>完整逻辑块</strong>！未满的不写入</div></div>
+        <div class="step"><span class="num">3</span><div class="body"><code>block_pool.cache_full_blocks(..., block_size=block_size × compress_ratio)</code></div></div>
+        <div class="step"><span class="num">4</span><div class="body">alignment_tokens 参数被忽略（逻辑块已自然对齐）</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>BlockPool.cache_full_blocks 内部逻辑 (上游)</h3>
+    <div class="step"><span class="num">1</span><div class="body">遍历 <code>blocks[num_cached_blocks : num_full_blocks]</code></div></div>
+    <div class="step"><span class="num">2</span><div class="body">对每个 block，从 <code>request.block_hashes</code> 取对应 hash</div></div>
+    <div class="step"><span class="num">3</span><div class="body"><strong>★ 注册到全局索引</strong>：<code>cached_block_hash_to_id[hash] = block.block_id</code></div></div>
+    <div class="step"><span class="num">4</span><div class="body">设置 <code>block.ref_cnt</code>，标记 block 已被缓存</div></div>
+    <div class="step"><span class="num">5</span><div class="body">后续请求通过 <code>get_cached_block(hash)</code> 即可找到此 block</div></div>
+  </div>
+</div>
+
+<!-- ===== 模块 4: Block 生命周期: 存储/查询/加载/驱逐 ===== -->
+<div class="section">
+  <h2>④ Block 生命周期：存储 → 查询 → 加载 → 驱逐</h2>
+
+  <div class="svg-wrap">
+    <svg viewBox="0 0 820 420" width="100%" preserveAspectRatio="xMidYMin meet">
+      <defs>
+        <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M1 1 L7 4 L1 7 Z" fill="#6b7280"/></marker>
+        <marker id="ab" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M1 1 L7 4 L1 7 Z" fill="#5b2dd9"/></marker>
+        <marker id="ag" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M1 1 L7 4 L1 7 Z" fill="#14a07b"/></marker>
+      </defs>
+
+      <!-- 存储 -->
+      <rect x="20" y="20" width="180" height="100" rx="10" fill="#ffffff" stroke="#d8dce3"/>
+      <text x="110" y="42" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">① 存储 (Store)</text>
+      <text x="30" y="60" font-size="11" fill="#6b7280">block_pool.cache_full_blocks()</text>
+      <text x="30" y="76" font-size="11" fill="#6b7280">hash → block_id 注册到</text>
+      <text x="30" y="92" font-size="11" fill="#6b7280">cached_block_hash_to_id</text>
+      <text x="30" y="108" font-size="11" fill="#14a07b">★ 全局共享索引建立</text>
+
+      <!-- 查询 -->
+      <rect x="220" y="20" width="180" height="100" rx="10" fill="#efe9ff" stroke="#c9b8ff"/>
+      <text x="310" y="42" text-anchor="middle" font-size="13" font-weight="600" fill="#5b2dd9">② 查询 (Query)</text>
+      <text x="230" y="60" font-size="11" fill="#2b2f3a">find_longest_cache_hit()</text>
+      <text x="230" y="76" font-size="11" fill="#2b2f3a">→ get_cached_block(hash)</text>
+      <text x="230" y="92" font-size="11" fill="#2b2f3a">链式遍历，miss → break</text>
+      <text x="230" y="108" font-size="11" fill="#5b2dd9">★ 压缩MLA用逻辑块哈希</text>
+
+      <!-- 加载 -->
+      <rect x="420" y="20" width="180" height="100" rx="10" fill="#ffffff" stroke="#d8dce3"/>
+      <text x="510" y="42" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">③ 加载 (Load)</text>
+      <text x="430" y="60" font-size="11" fill="#6b7280">allocate_new_computed_blocks()</text>
+      <text x="430" y="76" font-size="11" fill="#6b7280">→ touch() 刷新 LRU</text>
+      <text x="430" y="92" font-size="11" fill="#6b7280">→ get_new_blocks() 分配新块</text>
+      <text x="430" y="108" font-size="11" fill="#6b7280">外部KV: connector 异步加载</text>
+
+      <!-- 驱逐 -->
+      <rect x="620" y="20" width="180" height="100" rx="10" fill="#fef3e2" stroke="#fcd9a6"/>
+      <text x="710" y="42" text-anchor="middle" font-size="13" font-weight="600" fill="#d97706">④ 驱逐 (Evict)</text>
+      <text x="630" y="60" font-size="11" fill="#2b2f3a">get_new_blocks() 空间不足时</text>
+      <text x="630" y="76" font-size="11" fill="#2b2f3a">→ LRU evict 最久未 touch 的块</text>
+      <text x="630" y="92" font-size="11" fill="#2b2f3a">→ 从 hash 索引移除</text>
+      <text x="630" y="108" font-size="11" fill="#d97706">ref_cnt=0 的块才可驱逐</text>
+
+      <!-- 箭头 -->
+      <path d="M200 70 H220" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+      <path d="M400 70 H420" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+      <path d="M600 70 H620" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+
+      <!-- 下方详细流程 -->
+      <text x="20" y="160" font-size="13" font-weight="600" fill="#5b2dd9">详细流程</text>
+
+      <!-- 存储 detail -->
+      <rect x="20" y="174" width="780" height="60" rx="8" fill="#f5f6f8" stroke="#e6e8ec"/>
+      <text x="30" y="192" font-size="11" font-weight="600" fill="#2b2f3a">存储触发: update_from_output → kv_cache_manager.cache_blocks → 各 manager.cache_blocks → block_pool.cache_full_blocks</text>
+      <text x="30" y="208" font-size="11" fill="#6b7280">写入条件: 仅写完整 block（Full: num_tokens // block_size; Compress: num_tokens // (block_size × compress_ratio)）</text>
+      <text x="30" y="224" font-size="11" fill="#6b7280">效果: hash → KVCacheBlock 注册到全局字典，后续请求可命中</text>
+
+      <!-- 查询 detail -->
+      <rect x="20" y="244" width="780" height="60" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+      <text x="30" y="262" font-size="11" font-weight="600" fill="#5b2dd9">查询触发: schedule() → get_computed_blocks → coordinator.find_longest_cache_hit → manager.find_longest_cache_hit</text>
+      <text x="30" y="278" font-size="11" fill="#2b2f3a">Full: 按物理 block_size 链式查 / Compress: 按逻辑 block_size×compress_ratio 聚合查 / Mamba: 委托父类</text>
+      <text x="30" y="294" font-size="11" fill="#2b2f3a">多 group: 不动点迭代取最小 hit_length，FullAttention 首次查完后续截断，LCM 对齐</text>
+
+      <!-- 加载 detail -->
+      <rect x="20" y="314" width="780" height="60" rx="8" fill="#f5f6f8" stroke="#e6e8ec"/>
+      <text x="30" y="332" font-size="11" font-weight="600" fill="#2b2f3a">加载触发: allocate_slots → allocate_new_computed_blocks (命中块) + allocate_new_blocks (新块)</text>
+      <text x="30" y="348" font-size="11" fill="#6b7280">touch: 刷新命中块的 LRU 时间戳，防止被驱逐 / get_new_blocks: 从空闲池分配新物理块</text>
+      <text x="30" y="364" font-size="11" fill="#6b7280">外部 KV: connector.get_num_new_matched_tokens → WAITING_FOR_REMOTE_KVS → 异步接收 → 回调修正</text>
+
+      <!-- 驱逐 detail -->
+      <rect x="20" y="384" width="780" height="30" rx="8" fill="#fef3e2" stroke="#fcd9a6"/>
+      <text x="30" y="404" font-size="11" font-weight="600" fill="#d97706">驱逐触发: get_new_blocks 空间不足 → LRU 选最久未 touch 且 ref_cnt=0 的块 → 从 cached_block_hash_to_id 移除 → 归还空闲池</text>
+    </svg>
+  </div>
+</div>
+
+<!-- ===== 模块 5: Coordinator 不动点迭代 ===== -->
+<div class="section">
+  <h2>⑤ AscendHybridKVCacheCoordinator 不动点迭代</h2>
+  <div class="card brand">
+    <h3>多 group 协调算法 <span class="badge asc">Ascend 自维护</span></h3>
+    <p style="font-size:13px; margin:0;">不同 attention group（Full / Compress / SWA / Mamba）各有自己的 block_size 和命中长度。Coordinator 需要找到一个所有 group 都能命中的<strong>统一长度</strong>。</p>
+
+    <div class="svg-wrap" style="margin-top:8px;">
+      <svg viewBox="0 0 820 380" width="100%" preserveAspectRatio="xMidYMin meet">
+        <defs>
+          <marker id="ar2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M1 1 L7 4 L1 7 Z" fill="#6b7280"/></marker>
+        </defs>
+
+        <!-- 初始 -->
+        <rect x="20" y="20" width="180" height="50" rx="8" fill="#f5f6f8" stroke="#d8dce3"/>
+        <text x="110" y="42" text-anchor="middle" font-size="12" font-weight="600" fill="#2b2f3a">初始化</text>
+        <text x="110" y="58" text-anchor="middle" font-size="11" fill="#6b7280">hit_length = max_cache_hit</text>
+
+        <!-- 迭代 -->
+        <rect x="220" y="10" width="380" height="80" rx="10" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="410" y="30" text-anchor="middle" font-size="12" font-weight="600" fill="#5b2dd9">while True: 迭代每个 attention group</text>
+        <text x="230" y="48" font-size="11" fill="#2b2f3a">1. FullAttention: 首次查 get_cached_block 链，后续迭代仅截断</text>
+        <text x="230" y="64" font-size="11" fill="#2b2f3a">2. Compress: 按逻辑块查，可能缩短 curr_hit_length</text>
+        <text x="230" y="80" font-size="11" fill="#2b2f3a">3. SWA / Mamba: 各自查找，可能进一步缩短</text>
+
+        <!-- 收敛判断 -->
+        <rect x="620" y="20" width="180" height="50" rx="8" fill="#e2f6ee" stroke="#a8e0c9"/>
+        <text x="710" y="42" text-anchor="middle" font-size="12" font-weight="600" fill="#14a07b">收敛判断</text>
+        <text x="710" y="58" text-anchor="middle" font-size="11" fill="#6b7280">curr >= hit → break</text>
+
+        <path d="M200 45 H220" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+        <path d="M600 45 H620" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+        <path d="M710 70 V100 H410 V90" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar2)" stroke-dasharray="3 2"/>
+        <text x="560" y="98" font-size="10" fill="#6b7280">未收敛 → 重新迭代</text>
+
+        <!-- 后处理 -->
+        <rect x="20" y="120" width="380" height="70" rx="8" fill="#f5f6f8" stroke="#d8dce3"/>
+        <text x="30" y="140" font-size="12" font-weight="600" fill="#2b2f3a">EAGLE 处理</text>
+        <text x="30" y="158" font-size="11" fill="#6b7280">use_eagle 的 group: 多查 1 个 block 再 pop</text>
+        <text x="30" y="174" font-size="11" fill="#6b7280">验证集 eagle_verified: 长度变化时清空重验</text>
+
+        <rect x="420" y="120" width="380" height="70" rx="8" fill="#f5f6f8" stroke="#d8dce3"/>
+        <text x="430" y="140" font-size="12" font-weight="600" fill="#2b2f3a">LCM 对齐</text>
+        <text x="430" y="158" font-size="11" fill="#6b7280">lcm_block_size = lcm(所有 group 的 effective_block_size)</text>
+        <text x="430" y="174" font-size="11" fill="#6b7280">cache_hit_alignment_tokens = scheduler_block_size 或 lcm</text>
+
+        <!-- 截断 -->
+        <rect x="20" y="210" width="780" height="70" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+        <text x="30" y="230" font-size="12" font-weight="600" fill="#5b2dd9">FullAttention 截断 (后处理)</text>
+        <text x="30" y="248" font-size="11" fill="#2b2f3a">所有 FullAttention group 的命中块列表截断到最终 hit_length</text>
+        <text x="30" y="264" font-size="11" fill="#6b7280">num_blocks = cdiv(hit_length, effective_block_size) → del blks[num_blocks:]</text>
+        <text x="30" y="278" font-size="11" fill="#6b7280">DeepSeek-V4: C4 和 C128 两个 full-attention group 分别按各自 block_size 截断</text>
+
+        <!-- 输出 -->
+        <rect x="20" y="300" width="780" height="60" rx="8" fill="#e2f6ee" stroke="#a8e0c9"/>
+        <text x="30" y="320" font-size="12" font-weight="600" fill="#14a07b">输出</text>
+        <text x="30" y="338" font-size="11" fill="#2b2f3a">return (cache_hit_blocks_per_group, hit_length, longest_hit_length - hit_length)</text>
+        <text x="30" y="354" font-size="11" fill="#6b7280">第三个返回值 = partial_group_hit 偏差量（用于 PD 分离场景判断是否需要 connector 增强）</text>
+      </svg>
+    </div>
+
+    <div class="grid-3" style="margin-top:8px;">
+      <div class="card"><h4>effective_block_size 计算</h4>
+        <ul style="margin:0; padding-left:16px; font-size:12px;">
+          <li>Mamba: block_size（不乘 DCP）</li>
+          <li>其他: block_size × DCP</li>
+          <li>有 compress_ratio: × compress_ratio</li>
+        </ul>
+      </div>
+      <div class="card"><h4>简单 hybrid 优化</h4>
+        <ul style="margin:0; padding-left:16px; font-size:12px;">
+          <li>1 Full + 1 Other → 一次迭代即收敛</li>
+          <li>Full 首次查完后仅截断</li>
+          <li>is_simple_hybrid → break</li>
+        </ul>
+      </div>
+      <div class="card"><h4>Partial-group hit</h4>
+        <ul style="margin:0; padding-left:16px; font-size:12px;">
+          <li>各 group hit 不一致</li>
+          <li>min(per_group_hits) < fa_hit</li>
+          <li>PD 场景: 结合远端 connector 判断</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 模块 6: 各 Manager 关键差异总结 ===== -->
+<div class="section">
+  <h2>⑥ 各 Manager 关键差异总结</h2>
+  <div class="svg-wrap" style="padding:0; overflow-x:auto;">
+    <table>
+      <thead><tr>
+        <th style="width:12%">维度</th>
+        <th>FullAttention</th>
+        <th>Compress MLA (Ascend)</th>
+        <th>Sliding Window</th>
+        <th>Mamba (Ascend Patch)</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>查找粒度</strong></td>
+          <td>物理 block_size</td>
+          <td>逻辑 block_size × compress_ratio</td>
+          <td>物理 block_size</td>
+          <td>block_size (不乘 DCP)</td>
+        </tr>
+        <tr>
+          <td><strong>哈希聚合</strong></td>
+          <td>直接用 block_hashes</td>
+          <td>BlockHashListWithBlockSize 聚合</td>
+          <td>直接用 block_hashes</td>
+          <td>直接用 block_hashes</td>
+        </tr>
+        <tr>
+          <td><strong>链式 break</strong></td>
+          <td>✅ miss → break</td>
+          <td>✅ miss → break（逻辑块级）</td>
+          <td>✅ miss → break</td>
+          <td>✅ 委托父类</td>
+        </tr>
+        <tr>
+          <td><strong>cache_blocks 写入</strong></td>
+          <td>num_tokens // block_size</td>
+          <td>num_tokens // (block_size × compress_ratio)</td>
+          <td>num_tokens // block_size</td>
+          <td>同上游</td>
+        </tr>
+        <tr>
+          <td><strong>null_block 占位</strong></td>
+          <td>❌</td>
+          <td>❌</td>
+          <td>✅ 不可达 block</td>
+          <td>❌</td>
+        </tr>
+        <tr>
+          <td><strong>EAGLE drop</strong></td>
+          <td>✅ pop last</td>
+          <td>✅ pop last</td>
+          <td>✅ pop last</td>
+          <td>✅</td>
+        </tr>
+        <tr>
+          <td><strong>alignment 截断</strong></td>
+          <td>✅ alignment_tokens</td>
+          <td>✅（逻辑块自然对齐，通常跳过）</td>
+          <td>✅ alignment_tokens</td>
+          <td>✅</td>
+        </tr>
+        <tr>
+          <td><strong>DCP 缩放</strong></td>
+          <td>block_size × DCP</td>
+          <td>block_size × DCP × compress_ratio</td>
+          <td>block_size × DCP</td>
+          <td>不缩放</td>
+        </tr>
+        <tr>
+          <td><strong>Admission cap</strong></td>
+          <td>❌</td>
+          <td>✅ cdiv(max_model_len/compress, block_size)+1</td>
+          <td>✅ max_admission_blocks_per_request</td>
+          <td>❌</td>
+        </tr>
+        <tr>
+          <td><strong>来源</strong></td>
+          <td><span class="badge up">上游</span></td>
+          <td><span class="badge asc">Ascend 继承</span></td>
+          <td><span class="badge up">上游</span></td>
+          <td><span class="badge asc">Ascend Patch</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== 模块 7: 完整流程图 ===== -->
+<div class="section">
+  <h2>⑦ 完整流程图：从请求到命中到写入</h2>
+  <div class="svg-wrap">
+    <svg viewBox="0 0 820 520" width="100%" preserveAspectRatio="xMidYMin meet">
+      <defs>
+        <marker id="ar3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M1 1 L7 4 L1 7 Z" fill="#6b7280"/></marker>
+      </defs>
+
+      <!-- 请求到达 -->
+      <rect x="280" y="10" width="260" height="40" rx="8" fill="#f5f6f8" stroke="#d8dce3"/>
+      <text x="410" y="35" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">新请求到达 → 生成 block_hashes (链式SHA256)</text>
+      <path d="M410 50 V70" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar3)"/>
+
+      <!-- Scheduler -->
+      <rect x="280" y="74" width="260" height="40" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+      <text x="410" y="99" text-anchor="middle" font-size="13" font-weight="600" fill="#5b2dd9">Scheduler.schedule() → waiting 队列</text>
+      <path d="M410 114 V134" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar3)"/>
+
+      <!-- Coordinator -->
+      <rect x="200" y="138" width="420" height="40" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+      <text x="410" y="163" text-anchor="middle" font-size="13" font-weight="600" fill="#5b2dd9">coordinator.find_longest_cache_hit() · 不动点迭代</text>
+      <path d="M410 178 V198" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar3)"/>
+
+      <!-- 分支：各 manager -->
+      <rect x="20" y="202" width="180" height="80" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+      <text x="110" y="222" text-anchor="middle" font-size="12" font-weight="600" fill="#2b2f3a">FullAttention</text>
+      <text x="30" y="240" font-size="10" fill="#6b7280">物理块链式查</text>
+      <text x="30" y="256" font-size="10" fill="#6b7280">get_cached_block</text>
+      <text x="30" y="272" font-size="10" fill="#14a07b">miss → break</text>
+
+      <rect x="220" y="202" width="180" height="80" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+      <text x="310" y="222" text-anchor="middle" font-size="12" font-weight="600" fill="#5b2dd9">Compress MLA</text>
+      <text x="230" y="240" font-size="10" fill="#2b2f3a">逻辑块聚合查</text>
+      <text x="230" y="256" font-size="10" fill="#2b2f3a">BlockHashListWithBlockSize</text>
+      <text x="230" y="272" font-size="10" fill="#5b2dd9">×compress_ratio</text>
+
+      <rect x="420" y="202" width="180" height="80" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+      <text x="510" y="222" text-anchor="middle" font-size="12" font-weight="600" fill="#2b2f3a">Sliding Window</text>
+      <text x="430" y="240" font-size="10" fill="#6b7280">链式查 + null_block</text>
+      <text x="430" y="256" font-size="10" fill="#6b7280">跳过不可达块</text>
+      <text x="430" y="272" font-size="10" fill="#6b7280">block 回收</text>
+
+      <rect x="620" y="202" width="180" height="80" rx="8" fill="#efe9ff" stroke="#c9b8ff"/>
+      <text x="710" y="222" text-anchor="middle" font-size="12" font-weight="600" fill="#5b2dd9">Mamba (Patch)</text>
+      <text x="630" y="240" font-size="10" fill="#2b2f3a">委托父类查</text>
+      <text x="630" y="256" font-size="10" fill="#2b2f3a">+1 block 修复</text>
+      <text x="630" y="272" font-size="10" fill="#5b2dd9">不乘 DCP</text>
+
+      <!-- 汇总 -->
+      <path d="M110 282 V310 H410" stroke="#6b7280" stroke-width="1.5" fill="none"/>
+      <path d="M310 282 V310 H410" stroke="#6b7280" stroke-width="1.5" fill="none"/>
+      <path d="M510 282 V310 H410" stroke="#6b7280" stroke-width="1.5" fill="none"/>
+      <path d="M710 282 V310 H410" stroke="#6b7280" stroke-width="1.5" fill="none"/>
+      <path d="M410 310 V324" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar3)"/>
+
+      <rect x="200" y="328" width="420" height="40" rx="8" fill="#f5f6f8" stroke="#d8dce3"/>
+      <text x="410" y="353" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">取最小 hit_length + LCM 对齐 + FullAttention 截断</text>
+      <path d="M410 368 V388" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar3)"/>
+
+      <!-- allocate -->
+      <rect x="200" y="392" width="420" height="40" rx="8" fill="#ffffff" stroke="#d8dce3"/>
+      <text x="410" y="417" text-anchor="middle" font-size="13" font-weight="600" fill="#2b2f3a">allocate_slots: touch 命中块 + get_new_blocks 新块</text>
+      <path d="M410 432 V452" stroke="#6b7280" stroke-width="1.5" fill="none" marker-end="url(#ar3)"/>
+
+      <!-- 写入 cache -->
+      <rect x="200" y="456" width="420" height="50" rx="8" fill="#e2f6ee" stroke="#a8e0c9"/>
+      <text x="410" y="478" text-anchor="middle" font-size="13" font-weight="600" fill="#14a07b">★ update_from_output → cache_blocks → block_pool.cache_full_blocks</text>
+      <text x="410" y="496" text-anchor="middle" font-size="11" fill="#14a07b">hash → block 注册到全局索引 → 后续请求可命中！</text>
+    </svg>
+  </div>
+
+  <div class="legend">
+    <span><span class="dot" style="background:#5b2dd9;"></span>Ascend 自维护</span>
+    <span><span class="dot" style="background:#6b7280;"></span>上游复用</span>
+    <span><span class="dot" style="background:#14a07b;"></span>关键写入点</span>
+    <span><span class="dot" style="background:#d97706;"></span>驱逐/警告</span>
+  </div>
+</div>
+
+</div>
+</body>
+</html>
