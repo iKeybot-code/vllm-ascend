@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>下载引导 · vLLM Ascend Prefix Cache 分析报告</title>
+<title>下载中心 · vLLM Ascend Prefix Cache 分析报告</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -15,109 +15,182 @@
     justify-content: center;
     padding: 20px;
   }
+  .container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    max-width: 640px;
+    width: 100%;
+  }
   .card {
     background: #fff;
     border-radius: 16px;
-    padding: 48px 40px;
-    max-width: 520px;
-    width: 100%;
-    text-align: center;
+    padding: 32px 28px;
     box-shadow: 0 20px 60px rgba(0,0,0,0.15);
   }
-  .icon {
-    width: 72px;
-    height: 72px;
-    margin: 0 auto 20px;
+  .card-header {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+  .card-header .icon {
+    width: 64px;
+    height: 64px;
+    margin: 0 auto 16px;
     background: linear-gradient(135deg, #5b2dd9, #764ba2);
-    border-radius: 18px;
+    border-radius: 16px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 32px;
+    font-size: 28px;
     color: #fff;
   }
-  h1 {
-    font-size: 22px;
-    color: #2b2f3a;
-    margin-bottom: 8px;
-  }
-  .subtitle {
-    font-size: 14px;
-    color: #6b7280;
-    margin-bottom: 32px;
-    line-height: 1.6;
-  }
-  .file-info {
-    background: #f5f6f8;
-    border-radius: 10px;
-    padding: 16px 20px;
-    margin-bottom: 28px;
-    text-align: left;
-  }
-  .file-info .row {
+  .card-header h1 { font-size: 20px; color: #2b2f3a; margin-bottom: 4px; }
+  .card-header p { font-size: 13px; color: #6b7280; }
+
+  /* 文件卡片 */
+  .file-card {
     display: flex;
-    justify-content: space-between;
-    font-size: 13px;
-    padding: 4px 0;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 20px;
+    border: 1px solid #e6e8ec;
+    border-radius: 12px;
+    margin-bottom: 16px;
+    transition: border-color 0.2s;
   }
-  .file-info .row .label { color: #6b7280; }
-  .file-info .row .value { color: #2b2f3a; font-weight: 600; }
-  .btn-group { display: flex; flex-direction: column; gap: 12px; }
-  .btn {
-    display: block;
-    width: 100%;
-    padding: 14px 24px;
-    border: none;
+  .file-card:last-child { margin-bottom: 0; }
+  .file-card:hover { border-color: #c9b8ff; }
+  .file-card .file-icon {
+    width: 44px;
+    height: 44px;
     border-radius: 10px;
-    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+  }
+  .file-card.html .file-icon { background: #efe9ff; color: #5b2dd9; }
+  .file-card.md .file-icon { background: #e2f6ee; color: #14a07b; }
+  .file-card .file-meta { flex: 1; min-width: 0; }
+  .file-card .file-meta .name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #2b2f3a;
+    margin-bottom: 4px;
+    word-break: break-all;
+  }
+  .file-card .file-meta .desc { font-size: 12px; color: #6b7280; line-height: 1.5; }
+  .file-card .file-meta .size {
+    display: inline-block;
+    font-size: 11px;
+    color: #9aa0ac;
+    background: #f5f6f8;
+    padding: 2px 8px;
+    border-radius: 999px;
+    margin-top: 6px;
+  }
+  .file-card .actions { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+
+  /* 按钮 */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
     font-weight: 600;
     cursor: pointer;
     text-decoration: none;
+    white-space: nowrap;
     transition: all 0.2s;
   }
-  .btn-primary {
-    background: linear-gradient(135deg, #5b2dd9, #764ba2);
-    color: #fff;
-  }
-  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(91,45,217,0.35); }
-  .btn-secondary {
-    background: #fff;
-    color: #5b2dd9;
-    border: 2px solid #c9b8ff;
-  }
-  .btn-secondary:hover { background: #efe9ff; }
-  .tip {
+  .btn-primary { background: #5b2dd9; color: #fff; }
+  .btn-primary:hover { background: #4a1fb8; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(91,45,217,0.3); }
+  .btn-outline { background: #fff; color: #5b2dd9; border: 1.5px solid #c9b8ff; }
+  .btn-outline:hover { background: #efe9ff; }
+
+  /* 提示 */
+  .tip-box {
     margin-top: 24px;
-    padding-top: 20px;
-    border-top: 1px solid #e6e8ec;
+    padding: 16px 20px;
+    background: #f5f6f8;
+    border-radius: 10px;
     font-size: 12px;
-    color: #9aa0ac;
-    line-height: 1.6;
+    color: #6b7280;
+    line-height: 1.7;
   }
-  .tip strong { color: #6b7280; }
+  .tip-box strong { color: #2b2f3a; }
+  .tip-box code {
+    font-family: ui-monospace, monospace;
+    background: #e6e8ec;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    color: #2b2f3a;
+  }
 </style>
 </head>
 <body>
-<div class="card">
-  <div class="icon">&#128229;</div>
-  <h1>Prefix Cache 分析报告</h1>
-  <p class="subtitle">vLLM Ascend · 全链路架构图文版<br>点击下方按钮下载或预览</p>
+<div class="container">
+  <div class="card">
+    <div class="card-header">
+      <div class="icon">&#128229;</div>
+      <h1>Prefix Cache 分析报告 · 下载中心</h1>
+      <p>vLLM Ascend · 图文版 · 点击下载或预览</p>
+    </div>
 
-  <div class="file-info">
-    <div class="row"><span class="label">文件名</span><span class="value">vllm-ascend-prefix-cache-analysis.html</span></div>
-    <div class="row"><span class="label">格式</span><span class="value">HTML (含 SVG 图表)</span></div>
-    <div class="row"><span class="label">内容</span><span class="value">8 阶段全链路 + 对比矩阵</span></div>
-  </div>
+    <!-- 文件 1: 全链路架构 -->
+    <div class="file-card html">
+      <div class="file-icon">&#128196;</div>
+      <div class="file-meta">
+        <div class="name">vllm-ascend-prefix-cache-analysis.html</div>
+        <div class="desc">8 阶段全链路架构 + 上游 vs 自维护对比矩阵 + 关键文件索引</div>
+        <span class="size">32 KB</span>
+      </div>
+      <div class="actions">
+        <a class="btn btn-primary" href="/vllm-ascend-prefix-cache-analysis.html" download="vllm-ascend-prefix-cache-analysis.html">下载</a>
+        <a class="btn btn-outline" href="/vllm-ascend-prefix-cache-analysis.html" target="_blank">预览</a>
+      </div>
+    </div>
 
-  <div class="btn-group">
-    <a class="btn btn-primary" href="/vllm-ascend-prefix-cache-analysis.html" download="vllm-ascend-prefix-cache-analysis.html">&#11015; 下载 HTML 文件</a>
-    <a class="btn btn-secondary" href="/vllm-ascend-prefix-cache-analysis.html" target="_blank">&#128065; 在新标签页预览</a>
-  </div>
+    <!-- 文件 2: Attention 细节 -->
+    <div class="file-card html">
+      <div class="file-icon">&#128196;</div>
+      <div class="file-meta">
+        <div class="name">prefix-cache-attention-detail.html</div>
+        <div class="desc">不同 Attention 的命中/存储/查询/驱逐逻辑 + 7 模块图文详解</div>
+        <span class="size">41 KB</span>
+      </div>
+      <div class="actions">
+        <a class="btn btn-primary" href="/prefix-cache-attention-detail.html" download="prefix-cache-attention-detail.html">下载</a>
+        <a class="btn btn-outline" href="/prefix-cache-attention-detail.html" target="_blank">预览</a>
+      </div>
+    </div>
 
-  <div class="tip">
-    <strong>下载后操作：</strong><br>
-    保存到 <code>D:\workspace\codes\agents\reports\analysis\</code> 目录<br>
-    双击 .html 文件即可用浏览器打开查看
+    <!-- 文件 3: Markdown 版 -->
+    <div class="file-card md">
+      <div class="file-icon">&#128221;</div>
+      <div class="file-meta">
+        <div class="name">vllm-ascend-prefix-cache-analysis.md</div>
+        <div class="desc">Markdown 纯文本版，适合编辑器查看和版本管理</div>
+        <span class="size">60 KB</span>
+      </div>
+      <div class="actions">
+        <a class="btn btn-primary" href="/vllm-ascend-prefix-cache-analysis.md" download="vllm-ascend-prefix-cache-analysis.md">下载</a>
+        <a class="btn btn-outline" href="/vllm-ascend-prefix-cache-analysis.md" target="_blank">预览</a>
+      </div>
+    </div>
+
+    <div class="tip-box">
+      <strong>下载后操作：</strong><br>
+      1. 保存到 <code>D:\workspace\codes\agents\reports\analysis\</code> 目录<br>
+      2. 双击 <code>.html</code> 文件即可用浏览器打开查看<br>
+      3. <code>.md</code> 文件可用 VS Code / Typora 等编辑器打开
+    </div>
   </div>
 </div>
 </body>
