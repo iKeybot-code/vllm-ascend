@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>vLLM PR #51113 改动分析</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --fg: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --accent2: #3fb950;
+      --warn: #f0883e;
+      --danger: #f85149;
+      --code-bg: #161b22;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.75;
+    }
+    .container {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 24px;
+    }
+    h1 {
+      font-size: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 32px;
+    }
+    h2 {
+      color: var(--accent);
+      margin-top: 40px;
+      font-size: 1.4rem;
+      border-left: 4px solid var(--accent);
+      padding-left: 12px;
+    }
+    h3 {
+      color: var(--fg);
+      margin-top: 28px;
+      font-size: 1.15rem;
+    }
+    p { margin: 12px 0; }
+    ul, ol { padding-left: 24px; }
+    li { margin: 8px 0; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--code-bg);
+      border-radius: 6px;
+    }
+    code {
+      padding: 2px 6px;
+      font-size: 0.9em;
+    }
+    pre {
+      padding: 16px;
+      overflow-x: auto;
+      font-size: 0.88rem;
+      line-height: 1.6;
+      border: 1px solid var(--border);
+    }
+    .highlight { color: var(--accent2); }
+    .warn { color: var(--warn); }
+    .danger { color: var(--danger); }
+    .box {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin: 16px 0;
+      background: rgba(22, 27, 34, 0.6);
+    }
+    .box-tip { border-left: 4px solid var(--accent2); }
+    .box-warn { border-left: 4px solid var(--warn); }
+    .box-danger { border-left: 4px solid var(--danger); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 0.92rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      text-align: left;
+    }
+    th { background: rgba(88, 166, 255, 0.1); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .footer {
+      margin-top: 60px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>vLLM PR #51113 改动分析</h1>
+    <div class="subtitle">
+      主题：Keep mamba align prefill chunks block-aligned past <code>last_cache_position</code><br>
+      作者：ivanium（基于 kodek #45477、yanghui1-arch #47861 的工作）<br>
+      合并者：njhill | 状态：已合并至 main<br>
+      原文链接：<a href="https://github.com/vllm-project/vllm/pull/51113" target="_blank">https://github.com/vllm-project/vllm/pull/51113</a>
+    </div>
+
+    <h2>一、一句话总结</h2>
+    <p>
+      修复了 <strong>hybrid Mamba/GDN 模型</strong>在 <code>mamba_cache_mode="align"</code> 模式下、启用 <strong>EAGLE/MTP 投机解码</strong>时的 <span class="danger">前缀缓存污染（prefix-cache poisoning）</span>问题：
+      非最终的 prefill chunk 现在必须在 mamba block 边界结束，避免把"截断状态"当作"完整块状态"缓存，导致后续请求恢复出错状态。
+    </p>
+
+    <h2>二、核心概念速览</h2>
+    <table>
+      <tr><th>术语</th><th>含义</th></tr>
+      <tr><td>Mamba / GDN</td><td>状态空间模型（SSM）/ Gated Delta Net，一类循环层，状态按固定 block 写入缓存</td></tr>
+      <tr><td><code>mamba_cache_mode="align"</code></td><td>mamba 状态缓存按 block 对齐，slot p 应该保存第 (p+1)*block_size 个 token 之后的状态</td></tr>
+      <tr><td>EAGLE / MTP</td><td>投机解码技术，MTP 会预瞻若干 token，导致 <code>last_cache_position</code> 被提前一个 block</td></tr>
+      <tr><td><code>last_cache_position</code></td><td>调度器认为"还能被后续请求命中"的最大 token 位置</td></tr>
+      <tr><td><code>prefill_end</code></td><td>本次 prefill 实际结束位置（<code>max(num_prompt_tokens, num_tokens - 1)</code>）</td></tr>
+    </table>
+
+    <h2>三、问题背景：为什么需要这个修复？</h2>
+    <h3>3.1 关键不变量（Invariant）</h3>
+    <div class="box box-tip">
+      <strong>slot p 必须保存恰好第 (p + 1) × block_size 个 token 之后的状态。</strong><br>
+      例如 block_size = 1600 时，slot 0 保存 state@1600，slot 1 保存 state@3200，依此类推。
+    </div>
+    <p>
+      这个不变量是 prefix caching 的基础：后续请求如果命中 slot p，就期望拿到 state@(p+1)*block_size。
+    </p>
+
+    <h3>3.2 旧的漏洞</h3>
+    <p>
+      在旧的 <code>_mamba_block_aligned_split</code> 中，只有在 <code>end &lt; last_cache_position</code> 时才强制 chunk 在 block 边界结束。
+      超过 <code>last_cache_position</code> 后，任何 chunk end 都被接受。
+    </p>
+    <p>
+      当启用 EAGLE/MTP 时，<code>last_cache_position</code> 会被回退一个 block（并且短于两个 mamba block 的 prompt 会被置 0）。
+      于是出现如下场景：
+    </p>
+    <ol>
+      <li>多个 prefill 并发竞争 token budget；某个请求的第一个 chunk 只运行了 364 token，在 mid-block 处结束。</li>
+      <li>这个 chunk end 把 slot 0 写成了 state@364（而不是 state@1600）。</li>
+      <li>下一个 chunk 跨过了 1600，调度器把 slot 0 当作 state@1600 发布到 prefix cache。</li>
+      <li>后续请求命中这个 slot 时，恢复的是一个被截断的状态，输出错 token；没有报错，没有日志。</li>
+    </ol>
+
+    <div class="box box-danger">
+      <strong>危害：</strong> 无崩溃、无异常、HTTP 200，但生成内容错误。且只在并发/混合长度请求下出现，单请求场景反而"恰好安全"，因此极难定位。
+    </div>
+
+    <h2>四、代码改动详解</h2>
+    <h3>4.1 改动文件</h3>
+    <ul>
+      <li><code>vllm/v1/core/sched/scheduler.py</code>：修复核心逻辑</li>
+      <li><code>tests/v1/core/test_mamba_align_chunk_split.py</code>：新增回归测试</li>
+    </ul>
+
+    <h3>4.2 关键代码变化</h3>
+    <p><strong>修改前：</strong></p>
+    <pre><code>if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
+    return num_new_tokens
+
+# ...
+
+end = start + num_new_tokens
+if end &lt; last_cache_position:
+    # 强制 block 对齐
+    ...
+
+stops = (
+    next_block_boundary
+    if start % block_size != 0 and next_block_boundary &lt;= last_cache_position
+    else 0,
+    last_cache_position,
+    ...
+)</code></pre>
+
+    <p><strong>修改后：</strong></p>
+    <pre><code>prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+if start >= prefill_end:
+    return num_new_tokens
+
+# ...
+
+end = start + num_new_tokens
+# 不变量：slot p 保存 (p+1)*block_size 的状态
+# 只有 prefill 的最后一个 chunk 可以不落在 block 边界
+if end &lt; prefill_end:
+    # 强制 block 对齐
+    ...
+
+stops = (
+    # mid-block 开始的 chunk 必须在下一个边界停止
+    next_block_boundary if start % block_size != 0 else 0,
+    last_cache_position,
+    ...
+)</code></pre>
+
+    <h3>4.3 三个关键点</h3>
+    <table>
+      <tr><th>改动</th><th>作用</th></tr>
+      <tr>
+        <td><code>prefill_end</code> 替代 <code>last_cache_position</code> 作为对齐门槛</td>
+        <td>只有 prefill 的<strong>最后一个 chunk</strong> 才允许在非 block 边界结束；其余所有中间 chunk 必须对齐</td>
+      </tr>
+      <tr>
+        <td>删除 <code>next_block_boundary &lt;= last_cache_position</code> 条件</td>
+        <td>只要 chunk 从 mid-block 开始，无论是否超过 <code>last_cache_position</code>，都必须先对齐到下一个 block 边界</td>
+      </tr>
+      <tr>
+        <td>保留 <code>last_cache_position</code> 作为强制 stop</td>
+        <td>它仍然服务命中率：当等长请求的 EAGLE 回退命中真实落点时，能在这里物化一个 snapshot</td>
+      </tr>
+    </table>
+
+    <h2>五、测试用例分析</h2>
+    <p>
+      新增测试文件 <code>tests/v1/core/test_mamba_align_chunk_split.py</code>，共 20 个回归测试，全部 CPU-only 即可运行。
+      它构造真实的 <code>KVCacheManager</code>、<code>HybridKVCacheCoordinator</code> 和 <code>MambaManager</code>，无需 GPU 和权重。
+    </p>
+
+    <h3>5.1 核心测试场景</h3>
+    <table>
+      <tr><th>测试名</th><th>覆盖的问题</th></tr>
+      <tr><td><code>test_fragmented_first_chunk_does_not_poison_mamba_prefix_cache</code></td><td>EAGLE 把 last_cache_position 置 0 时，短 chunk 污染 slot 0</td></tr>
+      <tr><td><code>test_fragmented_tail_chunk_does_not_poison_mamba_prefix_cache</code></td><td>中间 chunk 在 block 内结束，污染下一个 block 的 slot</td></tr>
+      <tr><td><code>test_intermediate_chunk_ends_stay_block_aligned</code></td><td>多种 first_chunk budget 下，中间 chunk end 必须对齐</td></tr>
+      <tr><td><code>test_poisoning_is_block_size_independent</code></td><td>不同 block size（1536、12288）下不变量仍然成立</td></tr>
+      <tr><td><code>test_unaligned_resume_never_runs_past_its_block</code></td><td>fine-grained partial hit 或外部 KV 连接器导致 mid-block resume 时，必须先对齐</td></tr>
+    </table>
+
+    <h3>5.2 测试结果对比</h3>
+    <table>
+      <tr><th>测试文件</th><th>修复前</th><th>修复后</th></tr>
+      <tr><td><code>test_mamba_align_chunk_split.py</code></td><td>14 failed / 6 passed</td><td>20 passed</td></tr>
+      <tr><td><code>tests/v1/core/prefix_cache</code></td><td>29 passed</td><td>29 passed</td></tr>
+      <tr><td>scheduler + prefix_caching + single_type + prefix_cache</td><td>35 failed / 229 passed</td><td>35 failed / 229 passed*</td></tr>
+    </table>
+    <p class="muted">* 35 个失败是预先存在的 encoder-cache / EC-connector 问题，与本 PR 无关。</p>
+
+    <h2>六、为什么这个 bug 难发现？</h2>
+    <ul>
+      <li><strong>无症状：</strong> 不崩溃、不报错、HTTP 200，只是生成 token 错误。</li>
+      <li><strong>单请求安全：</strong> 低位的 slot 是 null block，<code>cache_full_blocks</code> 会跳过，所以单测无法触发。</li>
+      <li><strong>并发/混合长度才触发：</strong> 需要多个请求共享 prefix，且某个较长请求的命中能到达被污染的 slot。</li>
+      <li><strong>EAGLE/MTP 改变 last_cache_position：</strong> 引入了原本不存在的"未保护区域"。</li>
+    </ul>
+
+    <h2>七、对开发者的启示</h2>
+    <div class="box box-warn">
+      <ol>
+        <li><strong>缓存不变量必须全局保持：</strong> 不要只在"看起来会被命中"的范围内才维护。</li>
+        <li><strong>投机解码会改变调度语义：</strong> 任何依赖 <code>last_cache_position</code> 的逻辑都要考虑 EAGLE/MTP 的回退。</li>
+        <li><strong>并发测试是必需的：</strong> 很多 correctness bug 只在多请求共享 prefix 时出现。</li>
+        <li><strong>新 bug 可能表现为"无异常但结果错"：</strong> 对状态敏感的结构（Mamba/GDN/SSM）要格外警惕。</li>
+      </ol>
+    </div>
+
+    <h2>八、原文核心引用</h2>
+    <blockquote style="border-left: 4px solid var(--accent); padding-left: 16px; color: var(--muted);">
+      "A single request is accidentally safe — its low slots are null blocks, which cache_full_blocks skips — which is why this only appears under concurrency and was hard to pin down."
+    </blockquote>
+    <blockquote style="border-left: 4px solid var(--accent); padding-left: 16px; color: var(--muted);">
+      "Every request resuming from that hash silently restores a truncated state. Nothing raises, nothing logs, and the entry persists until restart."
+    </blockquote>
+
+    <div class="footer">
+      生成时间：2026-08-29 | 基于 vLLM PR #51113 原文及 diff 整理<br>
+      提示：本 HTML 可直接在浏览器中打开阅读。
+    </div>
+  </div>
+</body>
+</html>
