@@ -270,29 +270,112 @@ stops = (
       </ol>
     </div>
 
-    <h2>八、值得留意的边界场景：PD 分离与 dspark 草稿 token</h2>
+    <h2>八、PD 分离 + dspark 的真实根因：prefill 对齐逻辑错误地进入了 decode 路径</h2>
+
+    <h3>8.1 场景还原</h3>
     <p>
-      用户反馈指出：在 <strong>PD（Prefill-Decode）分离</strong>场景下，如果对齐门槛一味地使用 <code>prefill_end</code> 而完全放弃 <code>last_cache_position</code>，会导致 D 节点预算被截断。
+      在 <strong>PD（Prefill-Decode）分离</strong>架构中，P 节点负责长 prompt 的 prefill，D 节点只负责逐 token decode。
+      P 节点把 KV/Mamba 状态传给 D 节点后，D 节点每次只收到 <strong>1 个新 token</strong>，并把它和 D 节点上其他纯 decode 请求一起 batch 推理。
     </p>
-    <p>以一个具体例子说明：</p>
+    <p>此时如果 D 节点还开着 dspark（或 EAGLE/MTP）投机解码，会发生：</p>
     <ul>
-      <li>prompt 长度 380，投机解码 token 数 7</li>
-      <li>mamba block_size = 384</li>
-      <li>D 节点只有 5 个 token 的预算</li>
+      <li>dspark 需要为每个请求计算若干草稿 token（如 7 个）；</li>
+      <li>为了计算/验证这些草稿，D 节点调度器会为该请求分配一定数量的 token 预算（如 5 个）；</li>
+      <li>但 <code>_mamba_block_aligned_split</code> 一看到 <code>end &lt; prefill_end</code>，就认为"这个请求还有 prefill 没做完"，强制把 chunk end 对齐到下一个 mamba block 边界。</li>
+    </ul>
+
+    <h3>8.2 根因：调度器没有区分 "P 节点 prefill" 和 "D 节点 decode"</h3>
+    <p>以具体数字为例：</p>
+    <ul>
+      <li>prompt 长度 380，投机 token 数 7，mamba block_size = 384</li>
+      <li><code>prefill_end = max(380, 380 + 7 - 1) = 386</code></li>
+      <li>D 节点收到 P 节点传过来的 1 个 token，从位置 380 继续</li>
+      <li>若预算为 5，则 <code>end = 385</code>，而 <code>385 &lt; 386</code></li>
     </ul>
     <p>
-      此时 <code>prefill_end = max(380, 380 + 7 - 1) = 386</code>。
-      若按新逻辑 <code>end &lt; prefill_end</code> 强制对齐，D 节点从 380 开始运行，下一个 block 边界是 384，
-      于是 chunk 被截断为只处理 4 个 token（380→384），只剩 2 个 token 留给下一步；
-      而 D 节点原本期望用这 5 个预算去计算草稿 token，结果预算被对齐逻辑"吃掉"，影响投机解码流水线。
+      新逻辑触发强制对齐：下一个 block 边界是 384，于是 chunk 被截断为只处理 4 个 token（380→384），
+      剩下 1 个 token 预算被浪费，dspark 算草稿时发现实际可处理的 token 数（4）和原本预期的草稿长度不兼容，
+      只能回退草稿数量，严重时直接破坏投机解码流水线。
     </p>
 
-    <div class="box box-warn">
-      <strong>这一点说明：</strong><br>
+    <div class="box box-danger">
+      <strong>根因一句话：</strong><br>
+      <code>_mamba_block_aligned_split</code> 是为 <strong>P 节点 prefill</strong> 阶段维护 mamba 缓存不变量而设计的对齐逻辑，
+      却被无差别地应用到了 <strong>D 节点的 decode 路径</strong>上，而 decode 阶段本不该再受 prefill 块边界约束。
+    </div>
+
+    <h3>8.3 为什么修改前没有这个问题？</h3>
+    <p>旧逻辑是 <code>if end &lt; last_cache_position:</code>，在 EAGLE/MTP 场景下 <code>last_cache_position</code> 会被回退一个 block，
+      短于两个 block 时甚至被置 0。因此 <code>end &lt; last_cache_position</code> 不成立，对齐逻辑不触发，D 节点的 5 个预算能完整使用。
+    </p>
+    <p>
+      代价是：旧逻辑不会强制中间 chunk 在 block 边界结束，导致 slot 被污染（这正是 #51113 修复的 bug）。
+      新 PR 用 <code>prefill_end</code> 扩大了强制对齐范围，堵住了污染漏洞，却把 D 节点的 decode 路径也卷了进来。
+    </p>
+
+    <h3>8.4 最优解决方案</h3>
+    <p>核心原则：<strong>prefill 阶段需要 block 对齐以保证缓存不变量；decode 阶段不应该再触发 prefill 块对齐。</strong></p>
+
+    <p><strong>方案 A（推荐）：按阶段条件化对齐逻辑</strong></p>
+    <pre><code># 仅在请求仍处于 prefill 阶段时强制 block 对齐
+# decode 阶段（D 节点或已转为 decode 的请求）直接返回 num_new_tokens
+if request.is_prefill() and end &lt; prefill_end:
+    # 强制 block 对齐
+    ...</code></pre>
+    <p>
+      这是最干净、语义最清晰的改法。<code>_mamba_block_aligned_split</code> 的职责本来就是服务 prefill 阶段的 mamba 缓存对齐，
+      decode 阶段没有新的 mamba 状态需要写入 prefix cache，自然不该被截断。
+    </p>
+
+    <p><strong>方案 B：保留 last_cache_position 作为对齐门槛</strong></p>
+    <pre><code>if end &lt; last_cache_position:
+    # 强制 block 对齐
+    ...</code></pre>
+    <p>
+      这是 #51113 修改前的逻辑。它能避免 D 节点 decode 预算被截断，但会重新引入 prefix-cache poisoning 问题（即 #51113 要修复的 bug）。
+      因此单独回退不可行，最多只能作为组合方案的一部分。
+    </p>
+
+    <p><strong>方案 C：引入 "decode_phase_budget_preserved" 标记</strong></p>
+    <pre><code>if request.state == RequestState.DECODE:
+    return num_new_tokens
+if end &lt; prefill_end:
+    # 强制 block 对齐
+    ...</code></pre>
+    <p>
+      如果 vLLM 的调度模型里没有现成的 prefill/decode 阶段标记，可以显式加一个；但这会扩大改动范围，不如方案 A 自然。
+    </p>
+
+    <h3>8.5 方案对比</h3>
+    <table>
+      <tr><th>方案</th><th>优点</th><th>缺点</th><th>推荐度</th></tr>
+      <tr>
+        <td>A：按 <code>request.is_prefill()</code> 条件化</td>
+        <td>语义清晰、改动最小、同时保留 #51113 的不变量</td>
+        <td>需要确认 vLLM 调度器里阶段标记的可用性</td>
+        <td>⭐⭐⭐ 首选</td>
+      </tr>
+      <tr>
+        <td>B：回退到 <code>last_cache_position</code> 门槛</td>
+        <td>改动最小</td>
+        <td>重新引入 prefix-cache poisoning</td>
+        <td>❌ 不可单独使用</td>
+      </tr>
+      <tr>
+        <td>C：显式阶段标记</td>
+        <td>精确、可控</td>
+        <td>改动范围大，可能 touching 多个模块</td>
+        <td>⭐⭐ 备选</td>
+      </tr>
+    </table>
+
+    <h3>8.6 关键结论</h3>
+    <div class="box box-tip">
       <ol>
-        <li>本 PR 并<strong>没有</strong>把 <code>last_cache_position</code> 完全删掉，只是把它从"对齐门槛"降级为"强制 stop"；</li>
-        <li>如果后续有人进一步弱化 <code>last_cache_position</code>，需要特别验证 PD 分离 + 投机解码的组合；</li>
-        <li>缓存正确性（不变量）与调度效率（token budget 不浪费）之间存在张力，PD 分离会放大这种张力。</li>
+        <li>#51113 修复了 <strong>P 节点 prefill 阶段</strong>的缓存污染，但副作用是把对齐逻辑延伸到了 <strong>D 节点 decode 路径</strong>；</li>
+        <li>PD 分离场景下，D 节点每次只处理 1 个新 token，强制 prefill 块对齐会吃掉 dspark 草稿 token 的预算；</li>
+        <li>最优修复是在 <code>_mamba_block_aligned_split</code> 中按请求阶段做条件化，<strong>decode 阶段直接放行</strong>；</li>
+        <li>这不是简单回退 #51113，而是要在保持 P 节点不变量的前提下，把 D 节点从 prefill 对齐逻辑中解放出来。</li>
       </ol>
     </div>
 
