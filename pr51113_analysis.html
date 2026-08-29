@@ -270,7 +270,33 @@ stops = (
       </ol>
     </div>
 
-    <h2>八、原文核心引用</h2>
+    <h2>八、值得留意的边界场景：PD 分离与 dspark 草稿 token</h2>
+    <p>
+      用户反馈指出：在 <strong>PD（Prefill-Decode）分离</strong>场景下，如果对齐门槛一味地使用 <code>prefill_end</code> 而完全放弃 <code>last_cache_position</code>，会导致 D 节点预算被截断。
+    </p>
+    <p>以一个具体例子说明：</p>
+    <ul>
+      <li>prompt 长度 380，投机解码 token 数 7</li>
+      <li>mamba block_size = 384</li>
+      <li>D 节点只有 5 个 token 的预算</li>
+    </ul>
+    <p>
+      此时 <code>prefill_end = max(380, 380 + 7 - 1) = 386</code>。
+      若按新逻辑 <code>end &lt; prefill_end</code> 强制对齐，D 节点从 380 开始运行，下一个 block 边界是 384，
+      于是 chunk 被截断为只处理 4 个 token（380→384），只剩 2 个 token 留给下一步；
+      而 D 节点原本期望用这 5 个预算去计算草稿 token，结果预算被对齐逻辑"吃掉"，影响投机解码流水线。
+    </p>
+
+    <div class="box box-warn">
+      <strong>这一点说明：</strong><br>
+      <ol>
+        <li>本 PR 并<strong>没有</strong>把 <code>last_cache_position</code> 完全删掉，只是把它从"对齐门槛"降级为"强制 stop"；</li>
+        <li>如果后续有人进一步弱化 <code>last_cache_position</code>，需要特别验证 PD 分离 + 投机解码的组合；</li>
+        <li>缓存正确性（不变量）与调度效率（token budget 不浪费）之间存在张力，PD 分离会放大这种张力。</li>
+      </ol>
+    </div>
+
+    <h2>九、原文核心引用</h2>
     <blockquote style="border-left: 4px solid var(--accent); padding-left: 16px; color: var(--muted);">
       "A single request is accidentally safe — its low slots are null blocks, which cache_full_blocks skips — which is why this only appears under concurrency and was hard to pin down."
     </blockquote>
