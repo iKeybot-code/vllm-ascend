@@ -369,12 +369,85 @@ if end &lt; prefill_end:
       </tr>
     </table>
 
-    <h3>8.6 关键结论</h3>
+    <h3>8.6 vllm-ascend 侧最简单高效的实现方案</h3>
+    <p>
+      方案 A 需要改上游 <code>Scheduler._mamba_block_aligned_split</code>。在 vllm-ascend 里，最简单高效的做法是：
+      <strong>新写一个平台级 patch，对上游 <code>Scheduler._mamba_block_aligned_split</code> 做 monkey-patch</strong>，不需要改动 <code>patch_balance_schedule.py</code> 里复制的那一大段 <code>schedule()</code>。
+    </p>
+
+    <p><strong>为什么选 monkey-patch 而不是在子类覆盖？</strong></p>
+    <ul>
+      <li>vllm-ascend 里继承上游 <code>Scheduler</code> 的子类很多：<code>BalanceScheduler</code>、<code>RecomputeScheduler</code>、<code>ProfilingChunkScheduler</code>、<code>BatchJobAwareScheduler</code> 等；</li>
+      <li>这些子类都直接调用 <code>self._mamba_block_aligned_split(...)</code>，方法解析会回到上游 <code>Scheduler</code> 的定义；</li>
+      <li>如果每个子类都覆盖一遍，改动多、容易遗漏；直接 patch 上游类的方法，所有子类自动生效。</li>
+    </ul>
+
+    <p><strong>patch 实现思路（约 20 行）</strong>：</p>
+    <pre><code># vllm_ascend/patch/platform/patch_mamba_decode_align.py
+from functools import wraps
+from vllm.v1.core.sched.scheduler import Scheduler
+
+
+def _patch_mamba_block_aligned_split_for_decode():
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler._mamba_block_aligned_split, "_vllm_ascend_decode_patched", False):
+        return
+
+    original = Scheduler._mamba_block_aligned_split
+
+    @wraps(original)
+    def _patched(self, request, num_new_tokens, *args, **kwargs):
+        # 已经处于 decode 阶段的请求，不再受 prefill 块对齐约束
+        # request.is_prefill_chunk 为 False 表示 prompt 已经处理完，正在 decode
+        if not request.is_prefill_chunk:
+            return num_new_tokens
+        return original(self, request, num_new_tokens, *args, **kwargs)
+
+    _patched._vllm_ascend_decode_patched = True  # type: ignore[attr-defined]
+    Scheduler._mamba_block_aligned_split = _patched
+
+
+_patch_mamba_block_aligned_split_for_decode()</code></pre>
+
+    <p><strong>然后在 <code>vllm_ascend/patch/platform/__init__.py</code> 里加上一行：</strong></p>
+    <pre><code>import vllm_ascend.patch.platform.patch_mamba_decode_align  # noqa</code></pre>
+
+    <p><strong>这个 patch 的取舍：</strong></p>
+    <table>
+      <tr><th>优点</th><th>缺点 / 风险</th></tr>
+      <tr>
+        <td>改动极小，只改一个方法</td>
+        <td>依赖上游 <code>Scheduler._mamba_block_aligned_split</code> 的签名稳定</td>
+      </tr>
+      <tr>
+        <td>对所有 vllm-ascend 调度器子类同时生效</td>
+        <td>如果上游将来把判断逻辑移出该方法，patch 会失效</td>
+      </tr>
+      <tr>
+        <td>保留了 P 节点 prefill 阶段的块对齐不变量</td>
+        <td>需要验证非 PD 分离场景不受影响</td>
+      </tr>
+      <tr>
+        <td>不需要重新复制 <code>schedule()</code> 大段代码</td>
+        <td>——</td>
+      </tr>
+    </table>
+
+    <p><strong>关键判断条件的选择：</strong></p>
+    <ul>
+      <li>用 <code>request.is_prefill_chunk</code> 判断最自然：它在上游 <code>Request</code> 里已经存在，且语义就是"是否还在 prefill 阶段"；</li>
+      <li>也可以用 <code>request.num_computed_tokens &gt;= request.num_prompt_tokens</code>，但 <code>is_prefill_chunk</code> 更直接；</li>
+      <li>PD 分离 D 节点上，从 P 节点传过来的请求 <code>is_prefill_chunk</code> 应该为 <code>False</code>，因此会直接放行。</li>
+    </ul>
+
+    <h3>8.7 关键结论</h3>
     <div class="box box-tip">
       <ol>
         <li>#51113 修复了 <strong>P 节点 prefill 阶段</strong>的缓存污染，但副作用是把对齐逻辑延伸到了 <strong>D 节点 decode 路径</strong>；</li>
         <li>PD 分离场景下，D 节点每次只处理 1 个新 token，强制 prefill 块对齐会吃掉 dspark 草稿 token 的预算；</li>
         <li>最优修复是在 <code>_mamba_block_aligned_split</code> 中按请求阶段做条件化，<strong>decode 阶段直接放行</strong>；</li>
+        <li>在 vllm-ascend 里，最高效的实现是对上游 <code>Scheduler._mamba_block_aligned_split</code> 做平台级 monkey-patch，而不是在多个子类中重复覆盖；</li>
         <li>这不是简单回退 #51113，而是要在保持 P 节点不变量的前提下，把 D 节点从 prefill 对齐逻辑中解放出来。</li>
       </ol>
     </div>
