@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM Issue #43508 分析报告</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #f0f2f5;
+    color: #24292f;
+    line-height: 1.6;
+    padding: 24px;
+  }
+  .container {
+    max-width: 1080px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 28px;
+    color: #1f2328;
+    margin-bottom: 8px;
+    border-left: 5px solid #fa4549;
+    padding-left: 16px;
+  }
+  h2 {
+    font-size: 20px;
+    color: #1f2328;
+    margin: 28px 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #d0d7de;
+  }
+  h3 {
+    font-size: 16px;
+    color: #1f2328;
+    margin: 18px 0 10px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-right: 8px;
+  }
+  .badge-closed { background: #8250df; color: #fff; }
+  .badge-bug { background: #d73a4a; color: #fff; }
+  .badge-model { background: #0e8a16; color: #fff; }
+  .header-meta {
+    background: #fff;
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin: 16px 0 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  .header-meta p { margin: 6px 0; font-size: 14px; }
+  .header-meta a { color: #0969da; text-decoration: none; }
+  .header-meta a:hover { text-decoration: underline; }
+  .summary-box {
+    background: linear-gradient(135deg, #ffeef0 0%, #ffd7d9 100%);
+    border-left: 5px solid #fa4549;
+    padding: 18px 22px;
+    border-radius: 8px;
+    margin: 16px 0 28px;
+  }
+  .summary-box p { margin-bottom: 8px; font-size: 15px; }
+  .summary-box strong { color: #b42318; }
+  .card {
+    background: #fff;
+    border-radius: 10px;
+    padding: 22px 26px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  ul, ol { padding-left: 24px; margin: 10px 0; }
+  li { margin: 6px 0; }
+  code {
+    background: #f6f8fa;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 13px;
+    color: #cf222e;
+  }
+  pre {
+    background: #0d1117;
+    color: #e6edf3;
+    padding: 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 12px 0;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  pre code {
+    background: transparent;
+    color: inherit;
+    padding: 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 14px;
+  }
+  th, td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid #d0d7de;
+  }
+  th {
+    background: #f6f8fa;
+    font-weight: 600;
+    width: 30%;
+  }
+  tr:last-child td { border-bottom: none; }
+  .flow-diagram {
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 10px;
+    padding: 24px;
+    margin: 16px 0;
+    text-align: center;
+  }
+  .flow-node {
+    display: inline-block;
+    background: #f6f8fa;
+    border: 2px solid #d0d7de;
+    border-radius: 8px;
+    padding: 10px 18px;
+    margin: 6px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .flow-node.error {
+    background: #ffeef0;
+    border-color: #fa4549;
+    color: #b42318;
+  }
+  .flow-node.fix {
+    background: #dafbe1;
+    border-color: #1a7f37;
+    color: #116329;
+  }
+  .flow-arrow {
+    display: inline-block;
+    font-size: 18px;
+    color: #57606a;
+    margin: 0 6px;
+    vertical-align: middle;
+  }
+  .timeline {
+    border-left: 3px solid #d0d7de;
+    padding-left: 24px;
+    margin: 18px 0 18px 10px;
+  }
+  .timeline-item {
+    position: relative;
+    margin-bottom: 22px;
+  }
+  .timeline-item::before {
+    content: "";
+    position: absolute;
+    left: -33px;
+    top: 4px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #0969da;
+    border: 3px solid #fff;
+    box-shadow: 0 0 0 2px #0969da;
+  }
+  .timeline-item.error::before { background: #fa4549; box-shadow: 0 0 0 2px #fa4549; }
+  .timeline-item.fix::before { background: #1a7f37; box-shadow: 0 0 0 2px #1a7f37; }
+  .timeline-date {
+    font-size: 12px;
+    color: #57606a;
+    font-weight: 600;
+  }
+  .timeline-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 3px 0;
+    color: #1f2328;
+  }
+  .timeline-desc {
+    font-size: 13px;
+    color: #424a53;
+  }
+  .pr-link {
+    display: inline-block;
+    background: #ddf4ff;
+    color: #0969da;
+    padding: 2px 10px;
+    border-radius: 14px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-right: 6px;
+    text-decoration: none;
+  }
+  .pr-link:hover { background: #0969da; color: #fff; }
+  .pr-link.merged { background: #eae2ff; color: #8250df; }
+  .pr-link.merged:hover { background: #8250df; color: #fff; }
+  .pr-link.closed { background: #ffeef0; color: #b42318; }
+  .pr-link.closed:hover { background: #b42318; color: #fff; }
+  .key-highlight {
+    background: #fff8c5;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }
+  .status-pill {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    margin-top: 8px;
+  }
+  .status-resolved {
+    background: #dafbe1;
+    color: #116329;
+    border: 1px solid #1a7f37;
+  }
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 14px 0;
+  }
+  .two-col .card { margin-bottom: 0; }
+  @media (max-width: 768px) {
+    .two-col { grid-template-columns: 1fr; }
+    body { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- 标题区 -->
+  <h1>vLLM Issue #43508 深度分析</h1>
+  <div style="margin-bottom: 14px;">
+    <span class="badge badge-closed">已关闭 (Closed)</span>
+    <span class="badge badge-bug">Bug 类型</span>
+    <span class="badge badge-model">Hybrid Mamba</span>
+  </div>
+
+  <!-- 基本元数据 -->
+  <div class="header-meta">
+    <p><strong>标题原文：</strong>Hybrid Mamba + KV connector disagg blocked by <code>_mamba_block_aligned_split</code> assertion (NemotronH-550B repro)</p>
+    <p><strong>中文标题：</strong>混合 Mamba 模型 + KV Connector 分离式部署被 <code>_mamba_block_aligned_split</code> 断言阻断</p>
+    <p><strong>提交者：</strong><a href="https://github.com/dmvevents" target="_blank">dmvevents</a> &nbsp;|&nbsp; <strong>创建时间：</strong>2026-05-24 &nbsp;|&nbsp; <strong>关闭时间：</strong>约 2026-08-09（3周前）</p>
+    <p><strong>原始链接：</strong><a href="https://github.com/vllm-project/vllm/issues/43508" target="_blank">github.com/vllm-project/vllm/issues/43508</a></p>
+    <span class="status-pill status-resolved">✅ 最终状态：自行修复（Self-Resolved）</span>
+  </div>
+
+  <!-- 核心摘要 -->
+  <div class="summary-box">
+    <p><strong>一句话总结：</strong>当运行 Hybrid Mamba 模型（如 NemotronH-550B / Jamba）且同时启用 Mamba 对齐缓存模式 <code>mamba_cache_mode="align"</code> 与外部 KV Connector（如 NixlConnector）时，调度器中一个<span class="key-highlight">无条件断言</span>会导致 EngineCore 子进程在第一个推理请求到达时立即崩溃，使这类模型无法使用 vLLM 的分离式（Disaggregated）服务。</p>
+  </div>
+
+  <!-- 环境信息 -->
+  <h2>一、复现环境</h2>
+  <div class="card">
+    <table>
+      <tr>
+        <th>组件</th>
+        <th>具体配置</th>
+      </tr>
+      <tr>
+        <td>vLLM 版本</td>
+        <td><code>0.19.0</code>（验证 main 与 v0.21.0 也存在此问题）</td>
+      </tr>
+      <tr>
+        <td>运行镜像</td>
+        <td><code>nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1</code>（dynamo-vllm-efa）</td>
+      </tr>
+      <tr>
+        <td>硬件</td>
+        <td>2 × <code>p5en.48xlarge</code>（总计 16 × H200 GPU），EFA 互联</td>
+      </tr>
+      <tr>
+        <td>目标模型</td>
+        <td><code>nvidia/Nemotron-3-Ultra-550B-A55B-RL</code>（NemotronH SSM-Hybrid，Mamba + Attention + MoE，550B 参数）</td>
+      </tr>
+      <tr>
+        <td>部署拓扑</td>
+        <td>分离式服务（Disaggregated Serving）：LeaderWorkerSet 2 节点
+          <ul>
+            <li>1 个 Prefill Leader（<code>--disaggregation-mode prefill</code>）</li>
+            <li>1 个 Decode Leader（<code>--disaggregation-mode decode</code>）</li>
+          </ul>
+        </td>
+      </tr>
+      <tr>
+        <td>KV 传输层</td>
+        <td>NixlConnector + NIXL + LIBFABRIC transport（EFA RDMA）</td>
+      </tr>
+      <tr>
+        <td>关键启动参数</td>
+        <td>
+          <code>--no-disable-hybrid-kv-cache-manager</code>（启用混合 KV 缓存管理器）<br>
+          <code>mamba_cache_mode == "align"</code>（Mamba 缓存对齐模式）
+        </td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- 问题描述 -->
+  <h2>二、Bug 现象与触发位置</h2>
+  <div class="card">
+    <h3>2.1 触发断言的代码位置</h3>
+    <p>在文件 <code>vllm/v1/core/sched/scheduler.py</code> 的函数 <code>_mamba_block_aligned_split</code> 中，存在一条<span class="key-highlight">无条件断言</span>：</p>
+    <pre><code>assert num_external_computed_tokens == 0, \
+    "External KV connector is not verified yet"</code></pre>
+
+    <h3>2.2 崩溃流程</h3>
+    <div class="flow-diagram">
+      <div>
+        <div class="flow-node">请求到达 Frontend</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node">请求进入 Decode Leader</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node">调度器 <code>_mamba_block_aligned_split</code></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node error">断言失败 ❌<br>EngineCore 子进程崩溃</div>
+      </div>
+    </div>
+
+    <h3>2.3 直接影响</h3>
+    <ul>
+      <li>任何 Mamba-Hybrid 家族模型（Jamba、NemotronH 等）在 stock vLLM 中<strong>完全无法进行分离式服务</strong></li>
+      <li>请求永远无法完成 —— 崩溃发生在<strong>第一个请求</strong>到达调度器的瞬间</li>
+      <li>即使已经正确配置 NixlConnector / Hybrid KV cache 也无济于事</li>
+    </ul>
+  </div>
+
+  <!-- 根因分析 -->
+  <h2>三、根因分析</h2>
+  <div class="card">
+    <h3>3.1 断言存在的原因</h3>
+    <p>该断言的注释表明：开发者在实现 Mamba 对齐缓存分割逻辑时，<strong>尚未验证</strong>外部 KV Connector（通过 <code>num_external_computed_tokens &gt; 0</code> 表示有外部已计算的 KV tokens 需要处理）场景下的正确性，因此暂时用断言阻断了此路径。</p>
+
+    <h3>3.2 为什么会触发</h3>
+    <p>分离式服务模式下：</p>
+    <ol>
+      <li>Prefill Leader 完成预填充后，通过 NixlConnector 将 KV Cache 传递给 Decode Leader</li>
+      <li>Decode Leader 收到的请求带有「外部已计算的 tokens」（<code>num_external_computed_tokens &gt; 0</code>）</li>
+      <li>调度器调用 <code>_mamba_block_aligned_split</code> 对 Mamba SSM 状态做块对齐分割</li>
+      <li>断言直接被触发，进程崩溃</li>
+    </ol>
+
+    <h3>3.3 触发条件的组合（必须同时满足）</h3>
+    <div class="two-col">
+      <div class="card">
+        <p style="font-weight:600; color:#b42318; margin-bottom:8px;">✅ 条件全部满足才会触发</p>
+        <ul>
+          <li>Hybrid Mamba 模型（SSM + Attention 混合架构）</li>
+          <li><code>mamba_cache_mode == "align"</code></li>
+          <li>外部 KV Connector 启用（NixlConnector 等）</li>
+          <li>分离式服务（Prefill/Decode 分离）或 KV offload</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p style="font-weight:600; color:#116329; margin-bottom:8px;">⚠️ 相似但不同的触发路径</p>
+        <p>Issue <a href="https://github.com/vllm-project/vllm/issues/41515" target="_blank">#41515</a> 报告了<strong>相同的断言</strong>，但是：</p>
+        <ul>
+          <li>场景：<code>kv_offload + HMA</code></li>
+          <li>时机：<strong>后续请求</strong>（非首个）</li>
+          <li>模型：非 NemotronH</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- 复现步骤 -->
+  <h2>四、复现步骤</h2>
+  <div class="card">
+    <ol>
+      <li><strong>部署 2 节点 LWS 拓扑</strong>：1 个 Prefill Leader + 1 个 Decode Leader
+        <ul>
+          <li>模型：<code>nvidia/Nemotron-3-Ultra-550B-A55B-RL</code></li>
+          <li>分别设置 <code>--disaggregation-mode prefill</code> 和 <code>--disaggregation-mode decode</code></li>
+          <li>启用混合 KV 缓存管理器：<code>--no-disable-hybrid-kv-cache-manager</code></li>
+          <li>配置 NIXL + LIBFABRIC Connector（rev7 NIXL config）</li>
+        </ul>
+      </li>
+      <li><strong>等待就绪</strong>：确认两个 Leader 都达到 Ready 状态</li>
+      <li><strong>发送请求</strong>：通过 Frontend 发送一个简单的 chat completion 请求</li>
+      <li><strong>观察结果</strong>：Decode Leader 的 EngineCore 子进程<strong>立即因上述断言崩溃</strong>，请求永不完成</li>
+    </ol>
+  </div>
+
+  <!-- 验证与解决 -->
+  <h2>五、验证过程与修复方案</h2>
+
+  <div class="card">
+    <h3>5.1 现有的修复尝试（PR #42522）</h3>
+    <p>此问题与 PR <a href="https://github.com/vllm-project/vllm/pull/42522" target="_blank">#42522</a> 试图解决的 Jamba 问题完全相同。该 PR 因「过旧（stale）」被关闭，但代码并未合入主线。</p>
+
+    <h3>5.2 修复思路（#42522 的做法）</h3>
+    <p>修改文件 <code>vllm/model_executor/models/config.py</code>：当角色为 KV 消费者（<code>is_kv_consumer = True</code>）时，将 <code>mamba_block_size</code> 设置为 <code>max_model_len</code>，从而跳过有问题的对齐分割路径。</p>
+    <pre><code># 核心逻辑简化示意
+if is_kv_consumer and mamba_cache_mode == "align":
+    mamba_block_size = max_model_len  # 整个模型长度作为一个块，跳过分割
+else:
+    mamba_block_size = original_calculated_value  # 走原对齐逻辑</code></pre>
+
+    <h3>5.3 NemotronH 验证结果（2026-05-24）</h3>
+    <p>报告者将 PR #42522 的 commit <code>c27097c762934c23a454736d32a090c4708dadb8</code> cherry-pick 到 vLLM 0.19.0 后：</p>
+    <table>
+      <tr>
+        <th>验证项</th>
+        <th>结果</th>
+      </tr>
+      <tr>
+        <td>Patch 应用</td>
+        <td>✅ 干净应用：<code>Hunk #1 succeeded at 470 (offset 74 lines)</code>，无冲突</td>
+      </tr>
+      <tr>
+        <td>Engine 启动</td>
+        <td>✅ 首次通过调度器断言，达到 <code>1/1 Ready</code>，正常注册到 Frontend</td>
+      </tr>
+      <tr>
+        <td>KV Cache 分配</td>
+        <td>✅ <strong>58.73 GiB</strong> KV cache 分配成功</td>
+      </tr>
+      <tr>
+        <td>Hybrid SSM 注册</td>
+        <td>✅ NIXL 注册成功：num_blocks=9868, ratio=1, num_regions=12, num_descs=118416</td>
+      </tr>
+      <tr>
+        <td>NIXL/LIBFABRIC 握手</td>
+        <td>✅ EFA RDMA 握手状态正常</td>
+      </tr>
+      <tr>
+        <td>端到端 Chat Completion</td>
+        <td>✅ 成功返回：<code>{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}</code></td>
+      </tr>
+      <tr>
+        <td>性能指标</td>
+        <td>TTFT 冷启动 62s / 热启动 91ms；ITL 9.8 tok/s @ c=1（与基线噪声范围内一致）</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- 关联问题 -->
+  <h2>六、关联 Issue / PR 图谱</h2>
+  <div class="card">
+    <table>
+      <tr>
+        <th>编号</th>
+        <th>类型</th>
+        <th>标题 / 作用</th>
+        <th>状态</th>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/issues/41515" target="_blank">#41515</a></td>
+        <td>Issue</td>
+        <td>[kv_offload+HMA] Fails on chat subsequent request<br><span style="color:#57606a;font-size:12px;">相同断言，不同触发路径（后续请求 + KV offload）</span></td>
+        <td>相关</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/pull/42522" target="_blank">#42522</a></td>
+        <td>PR</td>
+        <td>[BugFix] Set mamba_block_size to max_model_len for KV consumers in align mode<br><span style="color:#57606a;font-size:12px;">针对 Jamba 的修复（被关闭，作者已验证 NemotronH 同样适用）</span></td>
+        <td><a href="#" class="pr-link closed">Closed</a></td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/pull/36687" target="_blank">#36687</a></td>
+        <td>PR</td>
+        <td>[PD][Nixl] Add support for hybrid SSM-FA models<br><span style="color:#57606a;font-size:12px;">已合并的 Nixl Connector 对混合模型的支持，被本调度器 Bug 阻断</span></td>
+        <td><a href="#" class="pr-link merged">Merged</a></td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/issues/40017" target="_blank">#40017</a></td>
+        <td>Issue</td>
+        <td>[Tracking] NIXL P/D Disaggregation for Hybrid Models<br><span style="color:#57606a;font-size:12px;">混合模型 NIXL 分离式部署追踪 Issue</span></td>
+        <td>Tracking</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/issues/37638" target="_blank">#37638</a></td>
+        <td>Issue</td>
+        <td>[Tracking] Mamba Heterogeneous TP for NIXL P/D Disaggregation<br><span style="color:#57606a;font-size:12px;">Mamba 异构 TP + NIXL 追踪 Issue</span></td>
+        <td>Tracking</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/issues/46407" target="_blank">#46407</a></td>
+        <td>Issue</td>
+        <td>Hybrid Mamba PD-disagg under pipeline-parallel (PP>1) emits degenerate output<br><span style="color:#57606a;font-size:12px;">PP&gt;1 场景下 FullAttention region_group_ids 塌缩的新问题（独立归档）</span></td>
+        <td>拆分出</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/vllm-project/vllm/pull/48263" target="_blank">#48263</a></td>
+        <td>PR</td>
+        <td>[KV Connector][4/N][NIXL] Recover all dedup'd HMA pool members under PP<br><span style="color:#57606a;font-size:12px;">PP&gt;1 问题 (#46407) 的修复 PR</span></td>
+        <td>修复</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- 时间线 -->
+  <h2>七、时间线</h2>
+  <div class="card">
+    <div class="timeline">
+      <div class="timeline-item error">
+        <div class="timeline-date">2026-05-24 （Issue 创建）</div>
+        <div class="timeline-title">发现并报告 Bug，附 NemotronH-550B 复现环境</div>
+        <div class="timeline-desc">确认断言位置，关联 Issue #41515 和已关闭的 PR #42522，验证 #42522 的 Patch 能让 Engine 启动（但尚未完整体验端到端）。</div>
+      </div>
+      <div class="timeline-item fix">
+        <div class="timeline-date">2026-05-24 02:18 UTC （首次评论更新）</div>
+        <div class="timeline-title">✅ 完整 Prefill→Decode 冒烟测试通过</div>
+        <div class="timeline-desc">
+          Cherry-pick PR #42522 到 v0.19.0，NemotronH-550B 端到端 Chat Completion 成功。<br>
+          性能：TTFT 冷 62s / 热 91ms，ITL 9.8 tok/s。<br>
+          确认主线 main / v0.21.0 断言仍在，NGC 最新 vllm-runtime 镜像停留在 0.19.0。
+        </div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-date">2026-06-23 （评论二）</div>
+        <div class="timeline-title">拆分 PP&gt;1 独立问题为 #46407</div>
+        <div class="timeline-desc">本 Issue 只关注 PP=1 的 <code>_mamba_block_aligned_split</code> 断言问题；而 Pipeline Parallel&gt;1 下跨节点导致输出退化（FullAttention <code>region_group_ids</code> 在 HMA 下塌缩到 Mamba 组）属于另一个独立 Bug，已归档到 #46407。</div>
+      </div>
+      <div class="timeline-item fix">
+        <div class="timeline-date">约 2026-08-09 （3周前关闭）</div>
+        <div class="timeline-title">🎉 Issue 关闭：全部问题已有修复路径</div>
+        <div class="timeline-desc">
+          <ul>
+            <li><strong>PP=1 部分：</strong>沿 PR #42522 思路修复（将 mamba_block_size 设为 max_model_len 跳过对齐分割）</li>
+            <li><strong>PP&gt;1 部分：</strong>#46407 已定位根因，修复 PR #48263 已提交（恢复 HMA 下所有去重池成员的 FA + 多组 SSM）</li>
+            <li>本 Issue 不再有独特追踪的内容，因此标记 Completed 关闭</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 修复后流程 -->
+  <h2>八、修复后的正确流程</h2>
+  <div class="card">
+    <div class="flow-diagram">
+      <div style="margin-bottom:16px;">
+        <p style="font-weight:600;color:#116329;margin-bottom:12px;">PP=1 场景：基于 #42522 思路</p>
+        <div class="flow-node">请求到达</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node">is_kv_consumer=True?<br>mamba_block_size = max_model_len</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node fix">跳过对齐分割 ✅<br>断言不再触发</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node fix">EngineCore 正常运行 ✅<br>NIXL RDMA 传输 KV</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node fix">推理完成 ✅</div>
+      </div>
+      <hr style="margin:18px 0;border:none;border-top:1px dashed #d0d7de;">
+      <div>
+        <p style="font-weight:600;color:#116329;margin-bottom:12px;">PP&gt;1 场景：基于 #46407 + #48263</p>
+        <div class="flow-node">PP 跨节点请求</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node fix">恢复所有去重 HMA 池成员<br>FA + 多组 SSM region_group_ids 正常 ✅</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-node fix">输出正常无退化 ✅</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 结论与建议 -->
+  <h2>九、结论与要点</h2>
+  <div class="card">
+    <ul>
+      <li><strong>问题本质：</strong>调度器中的<span class="key-highlight">防御性断言</span>未考虑外部 KV Connector 与 Mamba 对齐模式共存的场景，属于「未验证路径先阻断」的设计。</li>
+      <li><strong>影响范围：</strong>所有 Hybrid Mamba 架构模型（Jamba、NemotronH 系列）+ 任何使用外部 KV Connector 的分离式或 KV Offload 部署。</li>
+      <li><strong>短期缓解：</strong>对需要立即使用的用户，cherry-pick PR #42522 的 commit <code>c27097c762934c23a454736d32a090c4708dadb8</code> 到目标版本即可。</li>
+      <li><strong>长期解决：</strong>
+        <ul>
+          <li>PP=1：按 #42522 的 <code>mamba_block_size = max_model_len</code> 分支合并到主线</li>
+          <li>PP&gt;1：通过 #48263 修复去重池成员恢复逻辑</li>
+        </ul>
+      </li>
+      <li><strong>对 vLLM 开发者的教训：</strong>未来加入临时断言时应提供更细的 Feature Flag 或 Runtime Option，让高级用户可选择性关闭（而非硬崩溃）。</li>
+    </ul>
+  </div>
+
+  <div style="text-align:center; color:#57606a; font-size:12px; margin-top:30px; padding:16px 0;">
+    基于 GitHub vLLM Project Issue #43508 整理 · 生成时间 2026-08-30
+  </div>
+
+</div>
+</body>
+</html>
