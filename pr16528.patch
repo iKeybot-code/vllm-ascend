@@ -1,0 +1,3084 @@
+From bb831e889bf57bcc22ef41bcf07970966849fb0f Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Sun, 13 Sep 2026 23:11:46 +0800
+Subject: [PATCH 01/14] [BugFix][Spec Decode] Skip EAGLE prefix-cache drop on
+ PD producer for hybrid Mamba models
+
+On a PD prefill producer every content-hash match is a verified prompt
+block, so the EAGLE last-block drop in the hybrid KV cache coordinator is
+never needed. With hybrid Mamba align pages (1536 tokens) the drop erases
+the whole shared prefix of typical ~2K prompts: producer prefix hits are
+pinned to 0 (1600-token prompts -> 0/0, 3200-token prompts -> 1536/3072
+on the first full-attention group), the observed MTP prefix-cache kill
+band.
+
+* Derive the producer role from vllm_config.kv_transfer_config
+  (is_kv_producer and not is_kv_consumer; kv_both keeps upstream behavior)
+  and tag it onto KVCacheConfig in a wrapped
+  get_kv_cache_config_from_groups. The tag survives the scheduler-side
+  deepcopy and worker pickle IPC, and the coordinator factory can read it
+  without receiving VllmConfig.
+* AscendHybridKVCacheCoordinator reads the tag and skips the EAGLE block
+  drop in both find_longest_cache_hit and
+  find_longest_cache_hit_per_group; the EAGLE-group fallback marks
+  FullAttention groups only.
+* Add CPU-only unit tests for role tagging, the fallback gate and both
+  producer lookup paths.
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_kv_cache_coordinator.py        | 358 ++++++++++++++++++
+ vllm_ascend/ops/gdn.py                        |  12 +-
+ vllm_ascend/patch/__init__.py                 |  22 ++
+ .../platform/patch_kv_cache_coordinator.py    | 139 ++++++-
+ 4 files changed, 526 insertions(+), 5 deletions(-)
+ create mode 100644 tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+
+diff --git a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+new file mode 100644
+index 000000000000..c7c65ea62c16
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+@@ -0,0 +1,358 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Regression tests for the hybrid coordinator MTP + prefix-cache fix.
++
++The patch ``0001-fix-mtp-prefix-cache-hit-hybrid-pd`` makes three changes to
++``AscendHybridKVCacheCoordinator``:
++
++1. ``eagle_group_ids`` fallback flags **only FullAttention** groups when no
++   group carries ``is_eagle_group`` (Mamba/GDN groups must stay out because
++   draft models have no mamba layers).
++2. The standard ``find_longest_cache_hit`` skips the EAGLE last-block drop on
++   the PD prefill producer. The producer role is derived from
++   ``vllm_config.kv_transfer_config`` (``is_kv_producer and not
++   is_kv_consumer``), tagged onto ``KVCacheConfig`` by the wrapped
++   ``get_kv_cache_config_from_groups`` builder, and read back by the
++   coordinator - no role environment variable is involved.
++3. ``find_longest_cache_hit_per_group`` applies the same producer gating and
++   keeps the ``(block_hashes, max_cache_hit_length)`` call convention used by
++   RecomputeScheduler / DyntraLB / BalanceScheduler.
++
++These exercises run CPU-only: the heavy ``__init__`` is exercised with a
++lightweight BlockPool/manager factory, while lookup tests build the
++coordinator with ``__new__`` and drive it through recording fake managers.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from vllm.v1.core.kv_cache_coordinator import SpecGroup
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++
++from vllm_ascend.patch.platform import patch_kv_cache_coordinator as mod
++from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
++    AscendHybridKVCacheCoordinator,
++)
++
++HASH_BLOCK_SIZE = 128
++
++FA_SPEC = FullAttentionSpec(
++    block_size=128,
++    num_kv_heads=1,
++    head_size=8,
++    dtype=torch.float32,
++)
++MAMBA_SPEC = MambaSpec(
++    block_size=1536,
++    shapes=((1,),),
++    dtypes=(torch.float32,),
++    mamba_cache_mode="align",
++)
++
++
++# ---------------------------------------------------------------------------
++# Lightweight doubles for the real __init__ path (fix ① / role detection)
++# ---------------------------------------------------------------------------
++
++
++class _FakeBlockPool:
++    def __init__(self, *args, **kwargs):
++        pass
++
++
++class _FakeFAManager:
++    def __init__(self, **kwargs):
++        self.use_eagle = False
++
++
++class _FakeMambaManager:
++    def __init__(self, **kwargs):
++        self.use_eagle = False
++
++
++def _fake_manager_factory(**kwargs):
++    spec = kwargs["kv_cache_spec"]
++    if isinstance(spec, MambaSpec):
++        return _FakeMambaManager()
++    return _FakeFAManager()
++
++
++def _hybrid_config(*, mamba_eagle: bool = False) -> KVCacheConfig:
++    groups = [
++        KVCacheGroupSpec(["fa-layer"], FA_SPEC, False),
++        KVCacheGroupSpec(["mamba-layer"], MAMBA_SPEC, mamba_eagle),
++    ]
++    return KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=groups)
++
++
++def _make_coordinator(
++    monkeypatch,
++    *,
++    use_eagle: bool,
++    is_kv_producer: bool = False,
++    role_tagged: bool = True,
++    mamba_eagle: bool = False,
++):
++    monkeypatch.setattr(mod, "BlockPool", _FakeBlockPool)
++    monkeypatch.setattr(mod, "get_manager_for_kv_cache_spec", _fake_manager_factory)
++    kv_cache_config = _hybrid_config(mamba_eagle=mamba_eagle)
++    if role_tagged:
++        # The tag is placed by the get_kv_cache_config_from_groups wrapper in
++        # real engine startup.
++        kv_cache_config.is_kv_producer = is_kv_producer
++    return AscendHybridKVCacheCoordinator(
++        kv_cache_config=kv_cache_config,
++        max_model_len=4096,
++        use_eagle=use_eagle,
++        enable_caching=True,
++        enable_kv_cache_events=False,
++        dcp_world_size=1,
++        pcp_world_size=1,
++        hash_block_size=HASH_BLOCK_SIZE,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Fix ①: eagle fallback must not flag mamba groups
++# ---------------------------------------------------------------------------
++
++
++def test_eagle_fallback_flags_only_full_attention_group(monkeypatch):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True)
++    # Only the FA group is flagged; the mamba group stays out.
++    assert coordinator.eagle_group_ids == {0}
++    # Bit propagation after verify_and_split: FA manager eagle, mamba not.
++    assert coordinator.single_type_managers[0].use_eagle is True
++    assert coordinator.single_type_managers[1].use_eagle is False
++
++
++def test_no_eagle_group_when_speculative_decoding_disabled(monkeypatch):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=False)
++    assert coordinator.eagle_group_ids == set()
++    assert all(not manager.use_eagle for manager in coordinator.single_type_managers)
++
++
++def test_explicit_eagle_group_marker_takes_precedence(monkeypatch):
++    # DeepSeek-V4-style annotation path: a flagged group must be respected
++    # even when it is the mamba group (fallback must not overwrite it).
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True, mamba_eagle=True)
++    assert coordinator.eagle_group_ids == {1}
++
++
++# ---------------------------------------------------------------------------
++# Fix ② role detection: kv_transfer_config -> KVCacheConfig tag -> coordinator
++# ---------------------------------------------------------------------------
++
++
++def _vllm_config(*, is_kv_producer: bool, is_kv_consumer: bool):
++    return SimpleNamespace(
++        kv_transfer_config=SimpleNamespace(
++            is_kv_producer=is_kv_producer,
++            is_kv_consumer=is_kv_consumer,
++        )
++    )
++
++
++def test_coordinator_reads_producer_tag(monkeypatch):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True, is_kv_producer=True)
++    assert coordinator.is_kv_producer is True
++
++
++def test_coordinator_non_producer_tag(monkeypatch):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True, is_kv_producer=False)
++    assert coordinator.is_kv_producer is False
++
++
++def test_coordinator_defaults_non_producer_without_tag(monkeypatch):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True, role_tagged=False)
++    assert coordinator.is_kv_producer is False
++
++
++@pytest.mark.parametrize(
++    ("vllm_config", "expected"),
++    [
++        (_vllm_config(is_kv_producer=True, is_kv_consumer=False), True),
++        (_vllm_config(is_kv_producer=False, is_kv_consumer=True), False),
++        (_vllm_config(is_kv_producer=True, is_kv_consumer=True), False),
++        (SimpleNamespace(kv_transfer_config=None), False),
++        (SimpleNamespace(), False),
++        (None, False),
++    ],
++)
++def test_is_pure_kv_producer_role_semantics(vllm_config, expected):
++    assert mod._is_pure_kv_producer(vllm_config) is expected
++
++
++def test_kv_cache_config_builder_tags_and_forwards(monkeypatch):
++    sentinel_config = SimpleNamespace()
++    forwarded = {}
++
++    def _fake_builder(vllm_config, kv_cache_groups, available_memory):
++        forwarded["args"] = (vllm_config, kv_cache_groups, available_memory)
++        return sentinel_config
++
++    monkeypatch.setattr(mod, "_orig_get_kv_cache_config_from_groups", _fake_builder)
++    vllm_config = _vllm_config(is_kv_producer=True, is_kv_consumer=False)
++    result = mod._get_kv_cache_config_from_groups(vllm_config, "groups", 1234)
++    assert result is sentinel_config
++    assert result.is_kv_producer is True
++    assert forwarded["args"] == (vllm_config, "groups", 1234)
++
++
++def test_kv_cache_config_builder_tags_consumer_false(monkeypatch):
++    config = SimpleNamespace()
++
++    monkeypatch.setattr(
++        mod,
++        "_orig_get_kv_cache_config_from_groups",
++        lambda *args, **kwargs: config,
++    )
++    result = mod._get_kv_cache_config_from_groups(
++        _vllm_config(is_kv_producer=False, is_kv_consumer=True),
++        [],
++        0,
++    )
++    assert result.is_kv_producer is False
++
++
++def test_kv_cache_config_builder_install_is_idempotent():
++    import vllm.v1.core.kv_cache_utils as kcu
++
++    installed = kcu.get_kv_cache_config_from_groups
++    try:
++        mod._install_producer_role_kv_cache_config_tag()
++        once = kcu.get_kv_cache_config_from_groups
++        assert once is mod._get_kv_cache_config_from_groups
++        mod._install_producer_role_kv_cache_config_tag()
++        # The second install must not wrap the wrapper again.
++        assert kcu.get_kv_cache_config_from_groups is once
++        # The captured-original anchors still resolve through the tag logic.
++        assert mod._orig_get_kv_cache_config_from_groups is getattr(once, "__wrapped__", once)
++    finally:
++        kcu.get_kv_cache_config_from_groups = installed
++
++
++# ---------------------------------------------------------------------------
++# Recording fake managers for the lookup paths (fix ② / ③)
++# ---------------------------------------------------------------------------
++
++
++class _RecordingManager:
++    """Reports a hit equal to the offered max_length (never shrinks it) and
++    records the ``drop_eagle_block`` flag the coordinator passed."""
++
++    supports_fine_grained_hash_lookup = False
++    calls: list[dict] = []
++
++    @classmethod
++    def find_longest_cache_hit(
++        cls,
++        block_hashes,
++        max_length,
++        kv_cache_group_ids,
++        block_pool,
++        kv_cache_spec,
++        drop_eagle_block,
++        alignment_tokens,
++        dcp_world_size=1,
++        pcp_world_size=1,
++    ):
++        cls.calls.append({"max_length": max_length, "drop_eagle_block": drop_eagle_block})
++        return (([],), max_length)
++
++
++class _RecordingFA(_RecordingManager):
++    calls = []
++
++
++class _RecordingMamba(_RecordingManager):
++    calls = []
++
++
++def _make_lookup_coordinator(*, producer: bool):
++    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
++    coordinator.is_kv_producer = producer
++    coordinator.dcp_world_size = 1
++    coordinator.hash_block_size = HASH_BLOCK_SIZE
++    coordinator.scheduler_block_size = None
++    coordinator.lcm_block_size = MAMBA_SPEC.block_size
++    coordinator.enable_partial_hash_hits = False
++    coordinator.enable_caching = True
++    coordinator.block_pool = object()
++    coordinator.kv_cache_config = SimpleNamespace(kv_cache_groups=[object(), object()])
++    # FA group is the EAGLE group; the mamba group never is.
++    coordinator.attention_groups = [
++        SpecGroup(FA_SPEC, [0], _RecordingFA, True),
++        SpecGroup(MAMBA_SPEC, [1], _RecordingMamba, False),
++    ]
++    # Newer PD/partial-hit revisions cap the offered hit length at lookup
++    # entry. That behavior is outside this regression's scope; install a
++    # pass-through stub so the drop-gating logic runs with the original
++    # length. On the baseline revision the method does not exist and no stub
++    # is needed.
++    if hasattr(AscendHybridKVCacheCoordinator, "_producer_hit_cap"):
++        coordinator.pd_has_state_groups = False
++        coordinator.enable_partial_hash_hits = False
++        coordinator._producer_hit_cap = lambda length: length
++    return coordinator
++
++
++# ---------------------------------------------------------------------------
++# Fix ②: standard find_longest_cache_hit drop gating
++# ---------------------------------------------------------------------------
++
++
++def test_standard_lookup_drops_last_block_on_consumer():
++    coordinator = _make_lookup_coordinator(producer=False)
++    coordinator.find_longest_cache_hit(block_hashes=[], max_cache_hit_length=2048)
++    assert _RecordingFA.calls[-1]["drop_eagle_block"] is True
++    # Mamba group is never eagle.
++    assert _RecordingMamba.calls[-1]["drop_eagle_block"] is False
++
++
++def test_standard_lookup_skips_drop_on_producer():
++    coordinator = _make_lookup_coordinator(producer=True)
++    coordinator.find_longest_cache_hit(block_hashes=[], max_cache_hit_length=2048)
++    assert _RecordingFA.calls[-1]["drop_eagle_block"] is False
++    assert _RecordingMamba.calls[-1]["drop_eagle_block"] is False
++
++
++# ---------------------------------------------------------------------------
++# Fix ③: per-group lookup drop gating + call-site signature
++# ---------------------------------------------------------------------------
++
++
++def test_per_group_lookup_drops_last_block_on_consumer():
++    coordinator = _make_lookup_coordinator(producer=False)
++    _, hit_lengths = coordinator.find_longest_cache_hit_per_group([], 2048)
++    assert _RecordingFA.calls[-1]["drop_eagle_block"] is True
++    assert _RecordingMamba.calls[-1]["drop_eagle_block"] is False
++    assert hit_lengths == (2048, 2048)
++
++
++def test_per_group_lookup_skips_drop_on_producer():
++    coordinator = _make_lookup_coordinator(producer=True)
++    _, hit_lengths = coordinator.find_longest_cache_hit_per_group([], 2048)
++    assert _RecordingFA.calls[-1]["drop_eagle_block"] is False
++    assert _RecordingMamba.calls[-1]["drop_eagle_block"] is False
++    assert hit_lengths == (2048, 2048)
++
++
++def test_per_group_lookup_matches_scheduler_call_convention():
++    # RecomputeScheduler / DyntraLBScheduler / BalanceScheduler all call with
++    # exactly two positional args: (request.block_hashes, request.num_tokens-1).
++    coordinator = _make_lookup_coordinator(producer=True)
++    block_hashes = ["hash-0", "hash-1"]
++    blocks, hit_lengths = coordinator.find_longest_cache_hit_per_group(block_hashes, 4095)
++    assert len(blocks) == 2
++    assert _RecordingFA.calls[-1]["max_length"] == 4095
++    assert hit_lengths == (4095, 4095)
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index 0048466322bf..955cfa78c658 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -525,7 +525,17 @@ def _forward_core(
+             # Use the fused CANN operator when available (probed once, cached on
+             # the class) and applicable. It only supports the non-PCP case; fall
+             # back to the Triton pipeline under PCP or if the op is unavailable.
+-            use_fused_chunk = AscendGatedDeltaNetAttention._probe_fused_chunk() and get_pcp_group().world_size == 1
++            # NOTE: Do not use the fused CANN chunk operator for GatedDeltaNet
++            # prefill. When a partial prefix-cache hit resumes from a cached
++            # GDN state (explicit initial_state) and recomputes the tail, the
++            # fused op accumulates a small bf16 drift relative to computing the
++            # same span from scratch; the recurrent state magnifies that drift
++            # and greedy decoding occasionally diverges cold vs warm. The
++            # Triton chunk pipeline is bit-consistent between a cold span and a
++            # cached-state resume of the same span. Cold and warm must run the
++            # SAME kernel (mixing fused-cold with triton-warm would compare two
++            # different numerics), so prefill always takes the Triton path.
++            use_fused_chunk = False
+             if use_fused_chunk:
+                 # The fused op's state layout [N, Nv, Dv, Dk] matches ssm_state
+                 # directly, so no transpose is needed. Advanced indexing already
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index f7a2895129d3..b7fb4634b1ae 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -248,6 +248,28 @@
+ #    Future Plan:
+ #       Remove this patch when vLLM PR #42524 and #44243 is included in the supported
+ #       upstream vLLM version.
++#   2. `vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups`,
++#      `HybridKVCacheCoordinator.find_longest_cache_hit` and
++#      `...find_longest_cache_hit_per_group`
++#    Why:
++#       On a pure PD prefill producer (`kv_transfer_config.is_kv_producer`
++#       and not `is_kv_consumer`), every content-hash match is a verified
++#       prompt block, so the EAGLE last-block drop is never needed. With
++#       hybrid Mamba align pages (1536 tokens) the drop erases the whole
++#       shared prefix of typical ~2K prompts, pinning producer prefix hits
++#       to 0 (the MTP prefix-cache "kill band").
++#    How:
++#       Tag `is_kv_producer` onto KVCacheConfig while it is built (the
++#       coordinator factory never receives VllmConfig; the tag survives the
++#       scheduler-side deepcopy and worker pickle IPC), read it back in the
++#       coordinator, and skip the EAGLE drop in both lookup entry points on
++#       a tagged producer. The EAGLE-group fallback marks FullAttention
++#       groups only.
++#    Related PR (if no, explain why):
++#       No upstream PR; producer-side drop exemption for hybrid PD.
++#    Future Plan:
++#       Remove once upstream exposes the PD role to the coordinator or
++#       removes the EAGLE last-block drop for verified prompt blocks.
+ #
+ # ** 9. File: platform/patch_kv_cache_utils.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index 14cf16de94a5..d8e121effd92 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -1,12 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM projectx
++import functools
+ import sys
+-from collections.abc import Mapping
++from collections.abc import Callable, Mapping
+ from math import lcm
++from typing import Any
+ 
+ import vllm
+ import vllm.envs as envs_vllm
+ import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
++import vllm.v1.core.kv_cache_utils as vllm_kv_cache_utils
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_coordinator import (
+@@ -39,6 +42,87 @@
+ _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
+ 
+ 
++def _is_pure_kv_producer(vllm_config) -> bool:
++    """Whether this process is a PD prefill producer that never consumes.
++
++    ``kv_both`` instances (both ``is_kv_producer`` and ``is_kv_consumer``)
++    also accept consumer traffic and intentionally keep upstream behavior.
++    ``getattr`` fallbacks keep this callable with partial config doubles in
++    unit tests and across vLLM revisions.
++    """
++    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
++    return (
++        kv_transfer_config is not None
++        and getattr(kv_transfer_config, "is_kv_producer", False)
++        and not getattr(kv_transfer_config, "is_kv_consumer", False)
++    )
++
++
++# Module anchors populated by _install_producer_role_kv_cache_config_tag:
++# the captured upstream/Ascend builder and its role-tagging wrapper. Keeping
++# them module-global lets the unit tests substitute a fake upstream builder.
++_orig_get_kv_cache_config_from_groups: Callable[..., Any]
++_get_kv_cache_config_from_groups: Callable[..., Any]
++
++
++def _install_producer_role_kv_cache_config_tag() -> None:
++    """Make every built ``KVCacheConfig`` carry the pure-PD-producer role.
++
++    The coordinator factory below receives ``KVCacheConfig`` but not
++    ``VllmConfig``, so the role has to ride on the config object. This one
++    routine performs the whole hand-off:
++
++    1. Wrap whichever builder is currently registered (the Ascend
++       stride-aware planner in ``patch_kv_cache_utils`` may already have
++       replaced the upstream one) so the resulting config gets an
++       ``is_kv_producer`` tag.
++    2. Publish the wrapper on the ``kv_cache_utils`` module global -
++       ``get_kv_cache_configs`` invokes the builder as a module global, so
++       this covers the engine's multi-config path.
++    3. Compensate importers that may already hold a direct symbol binding
++       (e.g. the worker profile-run path in ``gpu_model_runner``) when this
++       patch loads late.
++
++    In the supported vLLM revisions ``KVCacheConfig`` is a plain (non-frozen,
++    no-``__slots__``) dataclass; the scheduler-side config is derived via
++    ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config``, which keeps
++    the attribute, while worker IPC is pickle-based and simply carries (or,
++    on an msgspec boundary, silently drops) the extra bool - nothing on the
++    worker side reads it. A marker attribute makes re-installation
++    idempotent under module reload.
++    """
++    global _orig_get_kv_cache_config_from_groups, _get_kv_cache_config_from_groups
++
++    current_builder = vllm_kv_cache_utils.get_kv_cache_config_from_groups
++    if getattr(current_builder, "_ascend_producer_role_tag", False):
++        # Module reload: keep the existing tagged wrapper (its __wrapped__
++        # points at the builder captured on first install).
++        _get_kv_cache_config_from_groups = current_builder
++        _orig_get_kv_cache_config_from_groups = getattr(current_builder, "__wrapped__", current_builder)
++        return
++    _orig_get_kv_cache_config_from_groups = current_builder
++
++    @functools.wraps(current_builder)
++    def _get_kv_cache_config_from_groups(vllm_config, *args, **kwargs):
++        kv_cache_config = _orig_get_kv_cache_config_from_groups(vllm_config, *args, **kwargs)
++        kv_cache_config.is_kv_producer = _is_pure_kv_producer(vllm_config)
++        return kv_cache_config
++
++    _get_kv_cache_config_from_groups._ascend_producer_role_tag = True  # type: ignore[attr-defined]
++    vllm_kv_cache_utils.get_kv_cache_config_from_groups = (  # type: ignore[attr-defined]
++        _get_kv_cache_config_from_groups
++    )
++    for _importer_module_name in ("vllm.v1.worker.gpu_model_runner",):
++        _importer = sys.modules.get(_importer_module_name)
++        if _importer is not None and hasattr(_importer, "get_kv_cache_config_from_groups"):
++            _importer.get_kv_cache_config_from_groups = (  # type: ignore[attr-defined]
++                _get_kv_cache_config_from_groups
++            )
++
++
++_install_producer_role_kv_cache_config_tag()
++
++
+ def _select_kv_token_budget(
+     max_model_len: int,
+     max_in_flight_tokens: int | None,
+@@ -134,9 +218,16 @@ def __init__(  # type: ignore[misc]
+         self.eagle_group_ids: set[int] = {  # type: ignore[no-redef]
+             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
+         }
+-        # Conservatively fall back to flag all groups when no group is flagged.
++        # Fall back to flagging only full-attention groups when no group is
++        # flagged. Mamba/GDN state hits do not use the eagle drop (a draft
++        # model has no mamba layers), and flagging mamba groups truncates
++        # cached state writes, collapsing hybrid prefix-cache hits to 0.
+         if use_eagle and not self.eagle_group_ids:
+-            self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
++            self.eagle_group_ids = {
++                i
++                for i, g in enumerate(kv_cache_config.kv_cache_groups)
++                if isinstance(g.kv_cache_spec, FullAttentionSpec)
++            }
+ 
+         extra_mgr_kwargs: dict = {"scheduler_block_size": scheduler_block_size}
+         extra_mgr_kwargs["needs_kv_cache_zeroing"] = kv_cache_config.needs_kv_cache_zeroing
+@@ -192,6 +283,18 @@ def __init__(  # type: ignore[misc]
+                 mgr.scheduler_block_size = self.lcm_block_size
+ 
+         self.use_eagle = use_eagle
++        # A PD prefill producer only schedules fresh-request prefills;
++        # every content-hash block it can match is a verified prompt block
++        # (draft/lookahead tokens live in the request-private tail, whose
++        # hash can never match another request). The EAGLE last-block drop
++        # is therefore never needed on the producer, and with hybrid
++        # mamba-align pages (1536 tokens) it erases the whole shared prefix
++        # of typical ~2K prompts, pinning P-side prefix hits to 0.
++        #
++        # The role is tagged onto KVCacheConfig by the
++        # ``get_kv_cache_config_from_groups`` wrapper above; configs built
++        # without the tag (e.g. unit tests) default to non-producer.
++        self.is_kv_producer = getattr(kv_cache_config, "is_kv_producer", False)
+ 
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+@@ -337,7 +440,7 @@ def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+                     curr_hit_length = min(curr_hit_length, hit_length_by_group[first_group_id])
+                     continue
+ 
+-                drop_eagle_block = use_eagle and idx not in eagle_verified
++                drop_eagle_block = use_eagle and idx not in eagle_verified and not self.is_kv_producer
+ 
+                 _max_length = curr_hit_length
+                 if drop_eagle_block and not isinstance(spec, MambaSpec):
+@@ -399,6 +502,34 @@ def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+         cache_hit_blocks = tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group)
+         return cache_hit_blocks, hit_length, longest_hit_length - hit_length
+ 
++    def find_longest_cache_hit_per_group(
++        self,
++        block_hashes: list[BlockHash],
++        max_cache_hit_length: int,
++    ) -> tuple[tuple[list[KVCacheBlock], ...], tuple[int, ...]]:
++        # PD + hybrid connector path. Skip the EAGLE drop on the prefill
++        # producer (see ``self.is_kv_producer``): matched content blocks
++        # are always verified prompt blocks there.
++        num_groups = len(self.kv_cache_config.kv_cache_groups)
++        hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
++        hit_lengths: list[int] = [0] * num_groups
++        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
++            blocks, group_hit = manager_cls.find_longest_cache_hit(
++                block_hashes=block_hashes,
++                max_length=max_cache_hit_length,
++                kv_cache_group_ids=group_ids,
++                block_pool=self.block_pool,
++                kv_cache_spec=spec,
++                drop_eagle_block=use_eagle and not self.is_kv_producer,
++                alignment_tokens=self._cache_hit_alignment_tokens,
++                dcp_world_size=self.dcp_world_size,
++                pcp_world_size=1,
++            )
++            for gid, blks in zip(group_ids, blocks):
++                hit_blocks[gid] = blks
++                hit_lengths[gid] = group_hit
++        return tuple(hit_blocks), tuple(hit_lengths)
++
+ 
+ def get_kv_cache_coordinator(  # type: ignore[misc]
+     kv_cache_config: KVCacheConfig,
+
+From faccac4bb10da5a4b2c10c3cb51f71a7a31786b9 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Sun, 13 Sep 2026 23:11:46 +0800
+Subject: [PATCH 02/14] [BugFix][Spec Decode] Suppress EAGLE page backoff in
+ mamba split on PD producer
+
+Scheduler-side companion to the producer drop exemption in the hybrid KV
+cache coordinator.
+
+Scheduler._mamba_block_aligned_split backs the last cacheable mamba-align
+page off by one block (and, on newer vLLM revisions, shifts the
+partial-tail checkpoint boundary) whenever the EAGLE block drop is
+active. On a producer this prevents prefill chunks from ending at the
+final full-page boundary. In mamba "align" mode the recurrent state of a
+page is materialized only across a chunk boundary (copy-on-write in
+MambaManager.allocate_new_blocks), so the final full state page stays
+unhashed: even with the coordinator fixed, hybrid hits reconcile to the
+per-group minimum and the mamba groups report one full page less
+(1600-token prompts -> 0 hit, 3200-token prompts -> 1536).
+
+Rather than copy the scheduler method across vLLM revisions, wrap it:
+on a pure producer, clear the drop bit for the duration of the original
+call and restore it afterwards. vLLM 0.28.x names the bit use_eagle;
+newer revisions expose the dedicated use_eagle_block_drop knob, and the
+wrapper handles both. The role comes from
+self.vllm_config.kv_transfer_config at call time (same source as the
+coordinator tag and the neighboring PD consumer split patch), so the
+wrapper is installed unconditionally and consumers, kv_both and
+standalone instances pass through unchanged.
+
+Verified in an isolated 16xNPU environment with Qwen3.6-27B hybrid
+(FullAttention + Mamba align) MTP PD: prefix hits 1600-token prompts
+0/0 -> 1536/1536 and 3200-token prompts 1536/3072 -> 3072/3072 across
+repeated runs, producer /metrics prefix_cache_hits_total +4608, probe
+latency 5.85s -> 0.33s.
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_kv_cache_coordinator.py        | 190 +++++++++++++++++-
+ vllm_ascend/patch/__init__.py                 |  21 ++
+ .../platform/patch_kv_cache_coordinator.py    | 112 +++++++++++
+ 3 files changed, 321 insertions(+), 2 deletions(-)
+
+diff --git a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+index c7c65ea62c16..43c44802b118 100644
+--- a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
++++ b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+@@ -16,12 +16,21 @@
+ 3. ``find_longest_cache_hit_per_group`` applies the same producer gating and
+    keeps the ``(block_hashes, max_cache_hit_length)`` call convention used by
+    RecomputeScheduler / DyntraLB / BalanceScheduler.
++4. ``Scheduler._mamba_block_aligned_split`` is wrapped unconditionally; on a
++   pure producer the EAGLE block-drop bit (``use_eagle`` on vLLM 0.28.x,
++   ``use_eagle_block_drop`` on newer revisions) is cleared for the duration
++   of the original call. Otherwise the scheduler's one-page backoff
++   suppresses the final full mamba-align chunk split and the boundary state
++   is never materialized. Consumers / kv_both / standalone instances pass
++   through unchanged.
+ 
+ These exercises run CPU-only: the heavy ``__init__`` is exercised with a
+-lightweight BlockPool/manager factory, while lookup tests build the
+-coordinator with ``__new__`` and drive it through recording fake managers.
++lightweight BlockPool/manager factory, lookup tests build the coordinator
++with ``__new__`` and drive it through recording fake managers, and the
++scheduler wrapper is exercised against one-off scheduler double classes.
+ """
+ 
++import inspect
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -354,5 +363,182 @@ def test_per_group_lookup_matches_scheduler_call_convention():
+     assert hit_lengths == (4095, 4095)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Fix ④: producer scheduler companion patch - the EAGLE one-page backoff in
++# _mamba_block_aligned_split must be suppressed on the producer, otherwise the
++# final full mamba-align state page is never materialized across a chunk
++# boundary and hybrid hits stay one page (1536 tokens) short.
++# ---------------------------------------------------------------------------
++
++
++class _RecordingSplitScheduler:
++    """Minimal scheduler double: records the drop bit seen by the original
++    split implementation and echoes its arguments."""
++
++    def __init__(
++        self,
++        *,
++        drop_attr: str = "use_eagle",
++        drop_value: bool = True,
++        raise_in_split: bool = False,
++        is_kv_producer: bool = False,
++        is_kv_consumer: bool = False,
++        kv_transfer_config_present: bool = True,
++        vllm_config_present: bool = True,
++    ):
++        # Explicitly do NOT carry the other-era attribute: the wrapper must
++        # pick the knob the running vLLM revision actually exposes.
++        setattr(self, drop_attr, drop_value)
++        self.raise_in_split = raise_in_split
++        self.observed_drop_bits: list[bool] = []
++        self.calls: list[tuple] = []
++        if vllm_config_present:
++            vllm_config = SimpleNamespace(model_config=SimpleNamespace())
++            if kv_transfer_config_present:
++                vllm_config.kv_transfer_config = SimpleNamespace(
++                    is_kv_producer=is_kv_producer,
++                    is_kv_consumer=is_kv_consumer,
++                )
++            else:
++                vllm_config.kv_transfer_config = None
++            self.vllm_config = vllm_config
++
++
++def _split_observed_bit(scheduler) -> bool:
++    if hasattr(scheduler, "use_eagle_block_drop"):
++        return scheduler.use_eagle_block_drop
++    return scheduler.use_eagle
++
++
++def _fresh_split_scheduler(**kwargs):
++    # One-off subclass so binding/replacing the method never pollutes the
++    # shared base class used by the other cases.
++    cls = type("_IsolatedSplitScheduler", (_RecordingSplitScheduler,), {})
++
++    def _record(self, request, num_new_tokens, nlc=0, nec=0):
++        self.observed_drop_bits.append(_split_observed_bit(self))
++        self.calls.append((num_new_tokens, nlc, nec))
++        if self.raise_in_split:
++            raise RuntimeError("boom")
++        return ("split", num_new_tokens)
++
++    cls._mamba_block_aligned_split = _record  # type: ignore[attr-defined]
++    return cls, cls(**kwargs)
++
++
++def test_scheduler_split_patch_clears_use_eagle_for_producer():
++    cls, scheduler = _fresh_split_scheduler(drop_value=True, is_kv_producer=True)
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++    result = scheduler._mamba_block_aligned_split("req", 1600)
++    # The original implementation observes the drop as disabled...
++    assert scheduler.observed_drop_bits == [False]
++    assert result == ("split", 1600)
++    # ...and the scheduler's own bit is restored afterwards.
++    assert scheduler.use_eagle is True
++
++
++def test_scheduler_split_patch_clears_use_eagle_block_drop_on_newer_vllm():
++    cls, scheduler = _fresh_split_scheduler(
++        drop_attr="use_eagle_block_drop",
++        drop_value=True,
++        is_kv_producer=True,
++    )
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++    scheduler._mamba_block_aligned_split("req", 3200, 1536, 0)
++    assert scheduler.observed_drop_bits == [False]
++    assert scheduler.calls == [(3200, 1536, 0)]
++    assert scheduler.use_eagle_block_drop is True
++    assert not hasattr(scheduler, "use_eagle")
++
++
++def test_scheduler_split_patch_restores_bit_on_exception():
++    cls, scheduler = _fresh_split_scheduler(
++        drop_value=True,
++        raise_in_split=True,
++        is_kv_producer=True,
++    )
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++    with pytest.raises(RuntimeError, match="boom"):
++        scheduler._mamba_block_aligned_split("req", 1600)
++    assert scheduler.use_eagle is True
++
++
++@pytest.mark.parametrize(
++    "scheduler_kwargs",
++    [
++        # Pure decode consumer.
++        {"is_kv_producer": False, "is_kv_consumer": True},
++        # kv_both serves both roles: keep upstream drop behavior.
++        {"is_kv_producer": True, "is_kv_consumer": True},
++        # Standalone instance, connector configured but neither PD role.
++        {"is_kv_producer": False, "is_kv_consumer": False},
++        # No connector at all / no vllm_config: must stay transparent.
++        {"kv_transfer_config_present": False},
++        {"vllm_config_present": False},
++    ],
++)
++def test_scheduler_split_patch_passes_through_non_producer(scheduler_kwargs):
++    cls, scheduler = _fresh_split_scheduler(drop_value=True, **scheduler_kwargs)
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++    result = scheduler._mamba_block_aligned_split("req", 1600)
++    # The original sees the untouched bit and runs exactly once.
++    assert scheduler.observed_drop_bits == [True]
++    assert result == ("split", 1600)
++    assert scheduler.use_eagle is True
++
++
++def test_scheduler_split_patch_is_idempotent():
++    cls, _ = _fresh_split_scheduler()
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++    wrapped_once = cls._mamba_block_aligned_split
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++    assert cls._mamba_block_aligned_split is wrapped_once
++
++
++def test_scheduler_split_patch_nests_behind_consumer_wrapper():
++    # When the registered method is the neighboring PD consumer patch's
++    # wrapper, the producer wrapper must replace that patch's module-global
++    # original instead of the class attribute (outer identity stays intact).
++    from vllm_ascend.patch.platform import (
++        patch_mamba_block_aligned_split as consumer_mod,
++    )
++
++    cls, scheduler = _fresh_split_scheduler(drop_value=True, is_kv_producer=True)
++    record = cls._mamba_block_aligned_split
++    saved_original = consumer_mod._original_mamba_block_aligned_split
++    try:
++        consumer_mod._original_mamba_block_aligned_split = record
++        cls._mamba_block_aligned_split = consumer_mod._mamba_block_aligned_split
++        mod._install_producer_mamba_block_aligned_split_patch(cls)
++        # The consumer wrapper remains the registered class method.
++        assert cls._mamba_block_aligned_split is consumer_mod._mamba_block_aligned_split
++        # The module global now points at the producer wrapper around record.
++        inner = consumer_mod._original_mamba_block_aligned_split
++        assert inner is not record
++        assert getattr(inner, "_ascend_producer_no_eagle_drop", False)
++        # functools.wraps keeps the wrapped signature transparent.
++        assert inspect.signature(inner) == inspect.signature(record)
++        # A producer call traverses consumer wrapper -> producer wrapper ->
++        # record with the drop bit cleared.
++        result = scheduler._mamba_block_aligned_split("req", 1600)
++        assert scheduler.observed_drop_bits == [False]
++        assert result == ("split", 1600)
++        assert scheduler.use_eagle is True
++        # Re-installing is idempotent at the nesting site.
++        mod._install_producer_mamba_block_aligned_split_patch(cls)
++        assert consumer_mod._original_mamba_block_aligned_split is inner
++    finally:
++        consumer_mod._original_mamba_block_aligned_split = saved_original
++
++
++def test_scheduler_split_patch_noop_without_split_method():
++    class _BareScheduler:
++        pass
++
++    # Must neither bind anything nor raise.
++    mod._install_producer_mamba_block_aligned_split_patch(_BareScheduler)
++    assert not hasattr(_BareScheduler, "_mamba_block_aligned_split")
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__, "-v"])
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index b7fb4634b1ae..a2ccc9329906 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -270,6 +270,27 @@
+ #    Future Plan:
+ #       Remove once upstream exposes the PD role to the coordinator or
+ #       removes the EAGLE last-block drop for verified prompt blocks.
++#   3. `vllm.v1.core.sched.scheduler.Scheduler._mamba_block_aligned_split`
++#    Why:
++#       Scheduler-side companion of fix 2: upstream backs the last cacheable
++#       mamba-align page off by one block while the EAGLE block drop is
++#       active, so the producer never ends a prefill chunk at the final full
++#       page boundary. Mamba "align" state materializes only across a chunk
++#       boundary (copy-on-write in MambaManager.allocate_new_blocks), so the
++#       final full state page stays unhashed and hybrid hits reconcile one
++#       page short (1600-token prompts -> 0 hit, 3200-token -> 1536).
++#    How:
++#       Wrap the method unconditionally; on a pure producer clear the drop
++#       bit (`use_eagle` on vLLM 0.28.x, `use_eagle_block_drop` on newer
++#       revisions) for the duration of the original call and restore it
++#       afterwards. The wrapper self-gates on
++#       `self.vllm_config.kv_transfer_config` at call time, so consumers,
++#       kv_both and standalone instances pass through unchanged.
++#    Related PR (if no, explain why):
++#       No upstream PR; producer-side scheduler companion of fix 2.
++#    Future Plan:
++#       Remove together with fix 2 once upstream splits mamba-align pages
++#       without the EAGLE backoff on PD producers.
+ #
+ # ** 9. File: platform/patch_kv_cache_utils.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index d8e121effd92..40a337fedda3 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -613,3 +613,115 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
+ _kv_cache_manager = sys.modules.get("vllm.v1.core.kv_cache_manager")
+ if _kv_cache_manager is not None:
+     _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
++
++
++def _install_producer_mamba_block_aligned_split_patch(scheduler_cls: Any = None) -> None:
++    """Suppress the EAGLE-block-drop backoff in ``_mamba_block_aligned_split``
++    on a PD prefill producer.
++
++    This is the scheduler-side companion of the producer drop exemption in
++    ``AscendHybridKVCacheCoordinator`` above.
++
++    ``Scheduler._mamba_block_aligned_split`` backs the last cacheable
++    mamba-align page off by one block (and, on newer vLLM revisions, shifts
++    the partial-tail checkpoint boundary) whenever the EAGLE block drop is
++    active. Consequently a producer prefill can never end a chunk at its
++    final full-page boundary. In mamba "align" mode the recurrent state of a
++    page is only materialized across a chunk boundary (copy-on-write in
++    ``MambaManager.allocate_new_blocks``), so the suppressed split leaves the
++    final full state page unhashed. Hybrid coordinator hits reconcile to the
++    per-group minimum: even with the full-attention group fixed by the
++    coordinator exemption above, the mamba groups report one full page less
++    (1600-token prompts -> 0 hit, 3200-token prompts -> 1536 with 1536-token
++    align pages) - the observed MTP prefix-cache kill band.
++
++    Rather than copy the scheduler method (its body moves between vLLM
++    revisions), invoke the original with the drop bit temporarily cleared:
++    every read of the bit inside the method exists solely to compensate for
++    the block drop, and on the producer matched blocks are always verified
++    prompt blocks and the coordinator never drops. Scheduling is
++    single-threaded per scheduler instance, so the temporary toggle is safe.
++    vLLM 0.28.x names the bit ``use_eagle``; newer revisions expose the
++    dedicated ``use_eagle_block_drop`` knob.
++
++    The wrapper is installed unconditionally and self-gates at call time on
++    ``self.vllm_config.kv_transfer_config`` (the same PD role source used by
++    the coordinator tag and the neighboring mamba split patch), so consumers
++    and standalone instances pass straight through with upstream behavior.
++
++    Installation nests behind the neighboring PD consumer mamba-split patch
++    when it is present: that patch delegates its fallthrough path to a
++    module-global original, so wrapping the global keeps its wrapper as the
++    method registered on the scheduler class (call order: consumer wrapper,
++    producer wrapper, upstream).
++    """
++    if scheduler_cls is None:
++        from vllm.v1.core.sched.scheduler import Scheduler
++
++        scheduler_cls = Scheduler
++
++    if not hasattr(scheduler_cls, "_mamba_block_aligned_split"):
++        return
++    registered_split = scheduler_cls._mamba_block_aligned_split
++    if getattr(registered_split, "_ascend_producer_no_eagle_drop", False):
++        # Idempotent under module reload.
++        return
++
++    # The consumer patch is imported before this module in
++    # vllm_ascend.patch.platform. When the registered method is its wrapper,
++    # wrap the upstream original held in its module global instead of the
++    # class attribute; otherwise wrap the registered method directly.
++    consumer_patch = sys.modules.get("vllm_ascend.patch.platform.patch_mamba_block_aligned_split")
++    consumer_wrapper = getattr(consumer_patch, "_mamba_block_aligned_split", None)
++    nested = consumer_wrapper is not None and consumer_wrapper is registered_split
++    if nested:
++        original_split = consumer_patch._original_mamba_block_aligned_split  # type: ignore[union-attr,attr-defined]
++    else:
++        original_split = registered_split
++    if getattr(original_split, "_ascend_producer_no_eagle_drop", False):
++        # Idempotent when both nesting sites are patched more than once.
++        return
++
++    @functools.wraps(original_split)
++    def _producer_mamba_block_aligned_split(
++        self,
++        request,
++        num_new_tokens: int,
++        num_new_local_computed_tokens: int = 0,
++        num_external_computed_tokens: int = 0,
++    ) -> int:
++        if not _is_pure_kv_producer(getattr(self, "vllm_config", None)):
++            return original_split(
++                self,
++                request,
++                num_new_tokens,
++                num_new_local_computed_tokens,
++                num_external_computed_tokens,
++            )
++        drop_attr = "use_eagle_block_drop" if hasattr(self, "use_eagle_block_drop") else "use_eagle"
++        original_drop = getattr(self, drop_attr)
++        setattr(self, drop_attr, False)
++        try:
++            return original_split(
++                self,
++                request,
++                num_new_tokens,
++                num_new_local_computed_tokens,
++                num_external_computed_tokens,
++            )
++        finally:
++            setattr(self, drop_attr, original_drop)
++
++    _producer_mamba_block_aligned_split._ascend_producer_no_eagle_drop = True  # type: ignore[attr-defined]
++    if nested:
++        consumer_patch._original_mamba_block_aligned_split = (  # type: ignore[union-attr,attr-defined]
++            _producer_mamba_block_aligned_split
++        )
++    else:
++        scheduler_cls._mamba_block_aligned_split = _producer_mamba_block_aligned_split
++
++
++# The wrapper self-gates on the PD role at call time, so installation is
++# unconditional (mirrors the other scheduler-side patch imported earlier in
++# this package).
++_install_producer_mamba_block_aligned_split_patch()
+
+From 477375aba4b4013ad9d5f950ca054f3a2cd06ea0 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Sun, 13 Sep 2026 23:49:53 +0800
+Subject: [PATCH 03/14] [BugFix] Keep producer Mamba split guard outermost
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_kv_cache_coordinator.py        | 70 +++++++++++--------
+ .../platform/patch_kv_cache_coordinator.py    | 48 +++++--------
+ 2 files changed, 58 insertions(+), 60 deletions(-)
+
+diff --git a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+index 43c44802b118..5a0958f72533 100644
+--- a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
++++ b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+@@ -495,40 +495,48 @@ def test_scheduler_split_patch_is_idempotent():
+     assert cls._mamba_block_aligned_split is wrapped_once
+ 
+ 
+-def test_scheduler_split_patch_nests_behind_consumer_wrapper():
+-    # When the registered method is the neighboring PD consumer patch's
+-    # wrapper, the producer wrapper must replace that patch's module-global
+-    # original instead of the class attribute (outer identity stays intact).
+-    from vllm_ascend.patch.platform import (
+-        patch_mamba_block_aligned_split as consumer_mod,
++def test_scheduler_split_patch_wraps_consumer_early_return_path():
++    # Model the neighboring consumer/sparse-index wrapper's early return: it
++    # consults use_eagle but deliberately never calls its saved original.
++    # The producer wrapper must be outermost for this path to see False.
++    cls, scheduler = _fresh_split_scheduler(drop_value=True, is_kv_producer=True)
++    inner = cls._mamba_block_aligned_split
++
++    def _consumer_early_return(self, request, num_new_tokens, nlc=0, nec=0):
++        self.observed_drop_bits.append(self.use_eagle)
++        return ("consumer-early-return", num_new_tokens)
++
++    _consumer_early_return.__wrapped__ = inner
++    cls._mamba_block_aligned_split = _consumer_early_return
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++
++    registered = cls._mamba_block_aligned_split
++    assert registered is not _consumer_early_return
++    assert registered.__wrapped__ is _consumer_early_return
++    assert getattr(registered, "_ascend_producer_no_eagle_drop", False)
++    assert scheduler._mamba_block_aligned_split("req", 1600) == (
++        "consumer-early-return",
++        1600,
+     )
++    assert scheduler.observed_drop_bits == [False]
++    assert scheduler.use_eagle is True
++
+ 
++def test_scheduler_split_patch_clears_and_restores_both_drop_attributes():
+     cls, scheduler = _fresh_split_scheduler(drop_value=True, is_kv_producer=True)
+-    record = cls._mamba_block_aligned_split
+-    saved_original = consumer_mod._original_mamba_block_aligned_split
+-    try:
+-        consumer_mod._original_mamba_block_aligned_split = record
+-        cls._mamba_block_aligned_split = consumer_mod._mamba_block_aligned_split
+-        mod._install_producer_mamba_block_aligned_split_patch(cls)
+-        # The consumer wrapper remains the registered class method.
+-        assert cls._mamba_block_aligned_split is consumer_mod._mamba_block_aligned_split
+-        # The module global now points at the producer wrapper around record.
+-        inner = consumer_mod._original_mamba_block_aligned_split
+-        assert inner is not record
+-        assert getattr(inner, "_ascend_producer_no_eagle_drop", False)
+-        # functools.wraps keeps the wrapped signature transparent.
+-        assert inspect.signature(inner) == inspect.signature(record)
+-        # A producer call traverses consumer wrapper -> producer wrapper ->
+-        # record with the drop bit cleared.
+-        result = scheduler._mamba_block_aligned_split("req", 1600)
+-        assert scheduler.observed_drop_bits == [False]
+-        assert result == ("split", 1600)
+-        assert scheduler.use_eagle is True
+-        # Re-installing is idempotent at the nesting site.
+-        mod._install_producer_mamba_block_aligned_split_patch(cls)
+-        assert consumer_mod._original_mamba_block_aligned_split is inner
+-    finally:
+-        consumer_mod._original_mamba_block_aligned_split = saved_original
++    scheduler.use_eagle_block_drop = "dedicated-original"
++
++    def _observe_both(self, request, num_new_tokens, nlc=0, nec=0):
++        self.calls.append((self.use_eagle, self.use_eagle_block_drop))
++        return num_new_tokens
++
++    cls._mamba_block_aligned_split = _observe_both
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++
++    assert scheduler._mamba_block_aligned_split("req", 3200) == 3200
++    assert scheduler.calls == [(False, False)]
++    assert scheduler.use_eagle is True
++    assert scheduler.use_eagle_block_drop == "dedicated-original"
+ 
+ 
+ def test_scheduler_split_patch_noop_without_split_method():
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index 40a337fedda3..f656fb57acc8 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -649,11 +649,11 @@ def _install_producer_mamba_block_aligned_split_patch(scheduler_cls: Any = None)
+     the coordinator tag and the neighboring mamba split patch), so consumers
+     and standalone instances pass straight through with upstream behavior.
+ 
+-    Installation nests behind the neighboring PD consumer mamba-split patch
+-    when it is present: that patch delegates its fallthrough path to a
+-    module-global original, so wrapping the global keeps its wrapper as the
+-    method registered on the scheduler class (call order: consumer wrapper,
+-    producer wrapper, upstream).
++    The producer wrapper is always installed around the method currently
++    registered on ``Scheduler``.  This ordering is important: the neighboring
++    consumer/sparse-index patch has early-return paths which never delegate to
++    its saved original.  An inner producer wrapper would therefore leave the
++    EAGLE drop enabled on those paths.
+     """
+     if scheduler_cls is None:
+         from vllm.v1.core.sched.scheduler import Scheduler
+@@ -667,20 +667,7 @@ def _install_producer_mamba_block_aligned_split_patch(scheduler_cls: Any = None)
+         # Idempotent under module reload.
+         return
+ 
+-    # The consumer patch is imported before this module in
+-    # vllm_ascend.patch.platform. When the registered method is its wrapper,
+-    # wrap the upstream original held in its module global instead of the
+-    # class attribute; otherwise wrap the registered method directly.
+-    consumer_patch = sys.modules.get("vllm_ascend.patch.platform.patch_mamba_block_aligned_split")
+-    consumer_wrapper = getattr(consumer_patch, "_mamba_block_aligned_split", None)
+-    nested = consumer_wrapper is not None and consumer_wrapper is registered_split
+-    if nested:
+-        original_split = consumer_patch._original_mamba_block_aligned_split  # type: ignore[union-attr,attr-defined]
+-    else:
+-        original_split = registered_split
+-    if getattr(original_split, "_ascend_producer_no_eagle_drop", False):
+-        # Idempotent when both nesting sites are patched more than once.
+-        return
++    original_split = registered_split
+ 
+     @functools.wraps(original_split)
+     def _producer_mamba_block_aligned_split(
+@@ -698,9 +685,16 @@ def _producer_mamba_block_aligned_split(
+                 num_new_local_computed_tokens,
+                 num_external_computed_tokens,
+             )
+-        drop_attr = "use_eagle_block_drop" if hasattr(self, "use_eagle_block_drop") else "use_eagle"
+-        original_drop = getattr(self, drop_attr)
+-        setattr(self, drop_attr, False)
++        # vLLM 0.28.x and newer revisions use different names.  Some
++        # transitional scheduler implementations expose both and different
++        # wrapper layers consult different attributes, so clear every
++        # attribute that exists and restore all of them after the call.
++        drop_attrs = tuple(
++            name for name in ("use_eagle", "use_eagle_block_drop") if hasattr(self, name)
++        )
++        original_drop_values = {name: getattr(self, name) for name in drop_attrs}
++        for name in drop_attrs:
++            setattr(self, name, False)
+         try:
+             return original_split(
+                 self,
+@@ -710,15 +704,11 @@ def _producer_mamba_block_aligned_split(
+                 num_external_computed_tokens,
+             )
+         finally:
+-            setattr(self, drop_attr, original_drop)
++            for name, value in original_drop_values.items():
++                setattr(self, name, value)
+ 
+     _producer_mamba_block_aligned_split._ascend_producer_no_eagle_drop = True  # type: ignore[attr-defined]
+-    if nested:
+-        consumer_patch._original_mamba_block_aligned_split = (  # type: ignore[union-attr,attr-defined]
+-            _producer_mamba_block_aligned_split
+-        )
+-    else:
+-        scheduler_cls._mamba_block_aligned_split = _producer_mamba_block_aligned_split
++    scheduler_cls._mamba_block_aligned_split = _producer_mamba_block_aligned_split
+ 
+ 
+ # The wrapper self-gates on the PD role at call time, so installation is
+
+From d0636245a949b85b01966d152b8a65d76d5560f2 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Sun, 13 Sep 2026 23:52:54 +0800
+Subject: [PATCH 04/14] [Test] Assert producer split wrapper ordering
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../patch/platform/test_patch_mamba_block_aligned_split.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py b/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
+index cdc7e29940ae..930e7c6ded78 100644
+--- a/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
++++ b/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
+@@ -187,5 +187,10 @@ def test_sparse_index_kpool_pd_consumer_still_preserves_verifier_window():
+ 
+ 
+ def test_patch_is_registered_with_upstream_signature():
+-    assert scheduler_module.Scheduler._mamba_block_aligned_split is _mamba_block_aligned_split
++    registered = scheduler_module.Scheduler._mamba_block_aligned_split
++    # The producer-role companion patch is loaded later and must stay
++    # outermost so this wrapper's sparse-index early-return path observes its
++    # temporary EAGLE-drop override.
++    assert getattr(registered, "_ascend_producer_no_eagle_drop", False)
++    assert registered.__wrapped__ is _mamba_block_aligned_split
+     assert inspect.signature(_mamba_block_aligned_split) == inspect.signature(_original_mamba_block_aligned_split)
+
+From 9aebbff3d54838b1cd9e8b1e1e2a3af1d4551327 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 00:20:49 +0800
+Subject: [PATCH 05/14] [Test] Cover scheduler without EAGLE drop attributes
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_kv_cache_coordinator.py         | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+index 5a0958f72533..f23805af45d5 100644
+--- a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
++++ b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+@@ -539,6 +539,24 @@ def _observe_both(self, request, num_new_tokens, nlc=0, nec=0):
+     assert scheduler.use_eagle_block_drop == "dedicated-original"
+ 
+ 
++def test_scheduler_split_patch_handles_producer_without_drop_attribute():
++    cls, scheduler = _fresh_split_scheduler(drop_value=True, is_kv_producer=True)
++    del scheduler.use_eagle
++
++    def _attribute_free_split(self, request, num_new_tokens, nlc=0, nec=0):
++        self.calls.append((num_new_tokens, nlc, nec))
++        return ("split", num_new_tokens)
++
++    cls._mamba_block_aligned_split = _attribute_free_split
++    mod._install_producer_mamba_block_aligned_split_patch(cls)
++
++    assert scheduler._mamba_block_aligned_split("req", 1600) == ("split", 1600)
++    assert scheduler.observed_drop_bits == []
++    assert scheduler.calls == [(1600, 0, 0)]
++    assert not hasattr(scheduler, "use_eagle")
++    assert not hasattr(scheduler, "use_eagle_block_drop")
++
++
+ def test_scheduler_split_patch_noop_without_split_method():
+     class _BareScheduler:
+         pass
+
+From 5dd419d8c2b883339555d6542c71b828dfc8036c Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 01:10:01 +0800
+Subject: [PATCH 06/14] [BugFix] Limit GDN Triton fallback to prefix caching
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ tests/ut/ops/test_gdn_mixed_batch.py |  8 ++++++++
+ vllm_ascend/ops/gdn.py               | 25 ++++++++++++++-----------
+ 2 files changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/tests/ut/ops/test_gdn_mixed_batch.py b/tests/ut/ops/test_gdn_mixed_batch.py
+index cff479ad62a4..84a850d4b90c 100644
+--- a/tests/ut/ops/test_gdn_mixed_batch.py
++++ b/tests/ut/ops/test_gdn_mixed_batch.py
+@@ -95,6 +95,7 @@ def rearrange_mixed_qkv(
+             torch.zeros(2, 1, 2),
+             torch.zeros(2, 1, 2, 2),
+         ),
++        cache_config=SimpleNamespace(enable_prefix_caching=True),
+     )
+     layer.rearrange_mixed_qkv = Mock(
+         name="rearrange_mixed_qkv",
+@@ -167,6 +168,13 @@ def chunk_gated_delta_rule(**kwargs):
+             "vllm_ascend.ops.gdn.chunk_gated_delta_rule",
+             side_effect=chunk_gated_delta_rule,
+         ) as chunk_mock,
++        patch.object(
++            AscendGatedDeltaNetAttention,
++            "_probe_fused_chunk",
++            side_effect=AssertionError(
++                "the fused chunk operator must not be probed when prefix caching is enabled"
++            ),
++        ),
+         patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
+         patch.object(
+             torch.ops._C_ascend,
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index 955cfa78c658..fc9b52fa2385 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -525,17 +525,20 @@ def _forward_core(
+             # Use the fused CANN operator when available (probed once, cached on
+             # the class) and applicable. It only supports the non-PCP case; fall
+             # back to the Triton pipeline under PCP or if the op is unavailable.
+-            # NOTE: Do not use the fused CANN chunk operator for GatedDeltaNet
+-            # prefill. When a partial prefix-cache hit resumes from a cached
+-            # GDN state (explicit initial_state) and recomputes the tail, the
+-            # fused op accumulates a small bf16 drift relative to computing the
+-            # same span from scratch; the recurrent state magnifies that drift
+-            # and greedy decoding occasionally diverges cold vs warm. The
+-            # Triton chunk pipeline is bit-consistent between a cold span and a
+-            # cached-state resume of the same span. Cold and warm must run the
+-            # SAME kernel (mixing fused-cold with triton-warm would compare two
+-            # different numerics), so prefill always takes the Triton path.
+-            use_fused_chunk = False
++            # A partial prefix-cache hit resumes from an explicit cached GDN
++            # state and recomputes its tail with the Triton implementation. A
++            # fused cold prefill accumulates differently in bf16; mixing those
++            # kernels can magnify the drift through the recurrent state and
++            # make greedy cold/warm decoding diverge. Keep both paths on Triton
++            # when prefix caching is enabled. Deployments that explicitly turn
++            # prefix caching off retain the faster fused path. Small floating-
++            # point differences may still remain across different chunk
++            # boundaries, so this does not claim bitwise equivalence.
++            use_fused_chunk = (
++                not self.cache_config.enable_prefix_caching
++                and AscendGatedDeltaNetAttention._probe_fused_chunk()
++                and get_pcp_group().world_size == 1
++            )
+             if use_fused_chunk:
+                 # The fused op's state layout [N, Nv, Dv, Dk] matches ssm_state
+                 # directly, so no transpose is needed. Advanced indexing already
+
+From 70014163574f6cc7672139b92736af879bde1459 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 02:43:57 +0800
+Subject: [PATCH 07/14] [BugFix] Cache cold prefills on kv_both instances
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_mamba_block_aligned_split.py     | 15 +++++++++++++++
+ .../platform/patch_mamba_block_aligned_split.py | 17 ++++++++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py b/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
+index 930e7c6ded78..cc43ebf8d50d 100644
+--- a/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
++++ b/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
+@@ -113,6 +113,21 @@ def test_pd_consumer_preserves_window_after_external_cache_hit():
+     assert result == 8
+ 
+ 
++def test_kv_both_cold_prefill_retains_mamba_boundary_split():
++    result = _mamba_block_aligned_split(
++        _scheduler(is_kv_consumer=True),
++        _request(
++            num_computed_tokens=0,
++            num_prompt_tokens=4800,
++            num_tokens=4800,
++        ),
++        num_new_tokens=4800,
++    )
++
++    # 4800 rounds down to 4608; EAGLE keeps one 384-token verifier block.
++    assert result == 4224
++
++
+ def test_producer_splits_window_after_external_cache_hit():
+     result = _mamba_block_aligned_split(
+         _scheduler(is_kv_consumer=False),
+diff --git a/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py b/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
+index cc0c8c2b4362..8d3fd490fb31 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
++++ b/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
+@@ -57,7 +57,22 @@ def _mamba_block_aligned_split(
+ ) -> int:
+     """Preserve PD windows and align sparse index-kpool cache groups."""
+     kv_transfer_config = self.vllm_config.kv_transfer_config
+-    if kv_transfer_config is not None and kv_transfer_config.is_kv_consumer:
++    # A consumer only needs the unsplit verifier window after some prefix has
++    # already been computed locally or loaded from the connector.  ``kv_both``
++    # also handles cold prefills; bypassing alignment for those requests means
++    # no reusable Mamba state is ever materialized, so neither HBM nor the KV
++    # pool can cache the prefix.
++    has_computed_prefix = (
++        request.num_computed_tokens
++        + num_new_local_computed_tokens
++        + num_external_computed_tokens
++        > 0
++    )
++    if (
++        kv_transfer_config is not None
++        and kv_transfer_config.is_kv_consumer
++        and has_computed_prefix
++    ):
+         return num_new_tokens
+ 
+     if _get_sparse_index_kpool(self.vllm_config.model_config) is not None:
+
+From 31445ccc7955c6d53b2dde632f799aec62290bc8 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 04:31:26 +0800
+Subject: [PATCH 08/14] [Test] Apply CI follow-up fixes
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ tests/ut/ops/test_gdn_layerwise_kv.py               |  1 +
+ tests/ut/ops/test_gdn_mixed_batch.py                |  4 +---
+ .../platform/test_patch_kv_cache_coordinator.py     |  5 ++---
+ .../patch/platform/patch_kv_cache_coordinator.py    |  4 +---
+ .../platform/patch_mamba_block_aligned_split.py     | 13 ++-----------
+ 5 files changed, 7 insertions(+), 20 deletions(-)
+
+diff --git a/tests/ut/ops/test_gdn_layerwise_kv.py b/tests/ut/ops/test_gdn_layerwise_kv.py
+index 6e482f170725..9a5bbdc640a2 100644
+--- a/tests/ut/ops/test_gdn_layerwise_kv.py
++++ b/tests/ut/ops/test_gdn_layerwise_kv.py
+@@ -73,6 +73,7 @@ def __init__(self):
+         self.register_buffer("conv_state", torch.zeros(1, 1, 2))
+         self.register_buffer("ssm_state", torch.zeros(1, 1, 2, 2))
+         self.prefix = "layers.0.linear_attn"
++        self.cache_config = SimpleNamespace(enable_prefix_caching=False)
+ 
+     @property
+     def kv_cache(self):
+diff --git a/tests/ut/ops/test_gdn_mixed_batch.py b/tests/ut/ops/test_gdn_mixed_batch.py
+index 84a850d4b90c..c98397445e01 100644
+--- a/tests/ut/ops/test_gdn_mixed_batch.py
++++ b/tests/ut/ops/test_gdn_mixed_batch.py
+@@ -171,9 +171,7 @@ def chunk_gated_delta_rule(**kwargs):
+         patch.object(
+             AscendGatedDeltaNetAttention,
+             "_probe_fused_chunk",
+-            side_effect=AssertionError(
+-                "the fused chunk operator must not be probed when prefix caching is enabled"
+-            ),
++            side_effect=AssertionError("the fused chunk operator must not be probed when prefix caching is enabled"),
+         ),
+         patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
+         patch.object(
+diff --git a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+index f23805af45d5..dc00bf9149b6 100644
+--- a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
++++ b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+@@ -30,7 +30,6 @@
+ scheduler wrapper is exercised against one-off scheduler double classes.
+ """
+ 
+-import inspect
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -506,13 +505,13 @@ def _consumer_early_return(self, request, num_new_tokens, nlc=0, nec=0):
+         self.observed_drop_bits.append(self.use_eagle)
+         return ("consumer-early-return", num_new_tokens)
+ 
+-    _consumer_early_return.__wrapped__ = inner
++    _consumer_early_return.__wrapped__ = inner  # type: ignore[attr-defined]
+     cls._mamba_block_aligned_split = _consumer_early_return
+     mod._install_producer_mamba_block_aligned_split_patch(cls)
+ 
+     registered = cls._mamba_block_aligned_split
+     assert registered is not _consumer_early_return
+-    assert registered.__wrapped__ is _consumer_early_return
++    assert registered.__wrapped__ is _consumer_early_return  # type: ignore[attr-defined]
+     assert getattr(registered, "_ascend_producer_no_eagle_drop", False)
+     assert scheduler._mamba_block_aligned_split("req", 1600) == (
+         "consumer-early-return",
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index f656fb57acc8..5c81d1fa2be3 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -689,9 +689,7 @@ def _producer_mamba_block_aligned_split(
+         # transitional scheduler implementations expose both and different
+         # wrapper layers consult different attributes, so clear every
+         # attribute that exists and restore all of them after the call.
+-        drop_attrs = tuple(
+-            name for name in ("use_eagle", "use_eagle_block_drop") if hasattr(self, name)
+-        )
++        drop_attrs = tuple(name for name in ("use_eagle", "use_eagle_block_drop") if hasattr(self, name))
+         original_drop_values = {name: getattr(self, name) for name in drop_attrs}
+         for name in drop_attrs:
+             setattr(self, name, False)
+diff --git a/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py b/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
+index 8d3fd490fb31..9e8eebea080c 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
++++ b/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
+@@ -62,17 +62,8 @@ def _mamba_block_aligned_split(
+     # also handles cold prefills; bypassing alignment for those requests means
+     # no reusable Mamba state is ever materialized, so neither HBM nor the KV
+     # pool can cache the prefix.
+-    has_computed_prefix = (
+-        request.num_computed_tokens
+-        + num_new_local_computed_tokens
+-        + num_external_computed_tokens
+-        > 0
+-    )
+-    if (
+-        kv_transfer_config is not None
+-        and kv_transfer_config.is_kv_consumer
+-        and has_computed_prefix
+-    ):
++    has_computed_prefix = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens > 0
++    if kv_transfer_config is not None and kv_transfer_config.is_kv_consumer and has_computed_prefix:
+         return num_new_tokens
+ 
+     if _get_sparse_index_kpool(self.vllm_config.model_config) is not None:
+
+From d83c6c12186e6a70e95ee06e5c0e095d1fe1f002 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 19:17:48 +0800
+Subject: [PATCH 09/14] [BugFix][Mamba] Fix fine-grained prefix hits with PD
+ and MTP
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_kv_cache_coordinator.py        | 22 ++++++
+ .../platform/test_patch_mamba_manager.py      | 48 ++++++++++++
+ .../kv_transfer/kv_p2p/mooncake_connector.py  | 78 ++++++++++++++++---
+ .../platform/patch_kv_cache_coordinator.py    | 28 +++++++
+ .../patch/platform/patch_mamba_manager.py     | 45 +++++++++++
+ 5 files changed, 212 insertions(+), 9 deletions(-)
+ create mode 100644 tests/ut/patch/platform/test_patch_mamba_manager.py
+
+diff --git a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+index dc00bf9149b6..3731bce1bef0 100644
+--- a/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
++++ b/tests/ut/patch/platform/test_patch_kv_cache_coordinator.py
+@@ -181,6 +181,28 @@ def test_coordinator_defaults_non_producer_without_tag(monkeypatch):
+     assert coordinator.is_kv_producer is False
+ 
+ 
++@pytest.mark.parametrize(
++    ("max_length", "expected"),
++    [
++        (145, 144),
++        (144, 128),
++        (17, 16),
++        (16, 0),
++    ],
++)
++def test_producer_hit_cap_leaves_recompute_token(monkeypatch, max_length, expected):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True, is_kv_producer=True)
++    coordinator.hash_block_size = 16
++    assert coordinator._producer_hit_cap(max_length) == expected
++
++
++@pytest.mark.parametrize("max_length", [16, 17, 144, 145])
++def test_producer_hit_cap_is_transparent_on_consumer(monkeypatch, max_length):
++    coordinator = _make_coordinator(monkeypatch, use_eagle=True, is_kv_producer=False)
++    coordinator.hash_block_size = 16
++    assert coordinator._producer_hit_cap(max_length) == max_length
++
++
+ @pytest.mark.parametrize(
+     ("vllm_config", "expected"),
+     [
+diff --git a/tests/ut/patch/platform/test_patch_mamba_manager.py b/tests/ut/patch/platform/test_patch_mamba_manager.py
+new file mode 100644
+index 000000000000..6a224e09acf2
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_mamba_manager.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++from types import SimpleNamespace
++
++from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
++
++# Importing vLLM activates the Ascend platform plugin, which replaces the
++# module-level ``MambaManager`` symbol with ``AscendMambaManager``.  Patch the
++# actual base class from the MRO so these tests keep exercising the override.
++BaseMambaManager = AscendMambaManager.__mro__[1]
++
++
++def _manager(*, producer: bool):
++    manager = AscendMambaManager.__new__(AscendMambaManager)
++    manager.is_kv_producer = producer
++    manager.block_size = 1024
++    manager.kv_cache_group_id = 3
++    manager._pending_partial_tail_offloads = []
++    return manager
++
++
++def test_producer_hot_partial_hit_hands_off_exact_source(monkeypatch):
++    calls = []
++
++    def add_local(self, request_id, blocks, local_tokens, external_tokens):
++        calls.append((request_id, blocks, local_tokens, external_tokens))
++
++    monkeypatch.setattr(BaseMambaManager, "add_local_computed_blocks", add_local)
++    manager = _manager(producer=True)
++    source = SimpleNamespace(is_null=False, block_id=17)
++
++    manager.add_local_computed_blocks("req", [source], 144, 0)
++
++    assert calls == [("req", [source], 144, 0)]
++    assert manager._pending_partial_tail_offloads == [("req", 3, source, 144)]
++
++
++def test_consumer_partial_hit_does_not_create_producer_handoff(monkeypatch):
++    monkeypatch.setattr(
++        BaseMambaManager,
++        "add_local_computed_blocks",
++        lambda self, request_id, blocks, local_tokens, external_tokens: None,
++    )
++    manager = _manager(producer=False)
++    source = SimpleNamespace(is_null=False, block_id=17)
++
++    manager.add_local_computed_blocks("req", [source], 144, 0)
++
++    assert manager._pending_partial_tail_offloads == []
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 3b1cb2ff9722..52d19e8ebdf6 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -195,10 +195,11 @@ def add_not_transfer_request(self, request_id: str):
+             self.finished_requests.add(request_id)
+             self.reqs_to_process.discard(request_id)
+ 
+-    def update_done_task_count(self, request_id: str):
++    def update_done_task_count(self, request_id: str, report_finished: bool = True):
+         with self.done_task_lock:
+             if request_id in self.reqs_to_process:
+-                self.finished_requests.add(request_id)
++                if report_finished:
++                    self.finished_requests.add(request_id)
+                 self.reqs_to_process.discard(request_id)
+                 self.delayed_free_requests.pop(request_id, None)
+             else:
+@@ -582,6 +583,7 @@ def add_request(
+         shard_idx: int = 0,
+         local_block_ids_replicate_k: BlockIds | None = None,
+         remote_block_ids_replicate_k: BlockIds | None = None,
++        report_finished: bool = True,
+     ):
+         """Add a new request to the queue for processing."""
+         if remote_port_send_num is None:
+@@ -602,6 +604,7 @@ def add_request(
+             "all_task_done": all_task_done,
+             "shard_idx": shard_idx,
+             "remote_block_size": remote_block_size,
++            "report_finished": report_finished,
+         }
+         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
+         self.request_queue.put(trans_info)
+@@ -758,7 +761,10 @@ def _handle_request(self, req_meta: dict[str, Any]):
+                             remote_request_id,
+                             e,
+                         )
+-                self.task_tracker.update_done_task_count(request_id)
++                self.task_tracker.update_done_task_count(
++                    request_id,
++                    report_finished=req_meta.get("report_finished", True),
++                )
+                 with self.proc_not_transfer_request_lock:
+                     self.proc_not_transfer_request.pop(remote_request_id, None)
+                 self._clear_failed_recv_request(request_id)
+@@ -1631,6 +1637,11 @@ def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: in
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+ 
++    def on_new_request(self, request: "Request") -> None:
++        """Apply Mamba P-side truncation before hashing and allocation."""
++        assert self.connector_scheduler is not None
++        self.connector_scheduler.on_new_request(request)
++
+     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+@@ -1764,6 +1775,7 @@ def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVC
+         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, BlockIds, int]] = {}
+         self._reqs_need_send: dict[str, float] = {}
+         self._reqs_in_batch: set[str] = set()
++        self._partial_tail_offloads: dict[str, list[tuple[int, int, int]]] = {}
+ 
+         # master-slave meta information for cross-nodes
+         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
+@@ -1839,7 +1851,8 @@ def _get_transfer_block_ids(self, block_ids: BlockIds, prompt_len: int) -> Block
+                         f"prompt_len={prompt_len}, tokens_per_block={group_info.tokens_per_block}, "
+                         f"required_block_count={num_prompt_state_blocks}, available_block_count={len(blocks)}."
+                     )
+-                transfer_block_ids.append(blocks[num_prompt_state_blocks - 1 : num_prompt_state_blocks])
++                transfer_block_idx = num_prompt_state_blocks - 1
++                transfer_block_ids.append(blocks[transfer_block_idx : transfer_block_idx + 1])
+             else:
+                 # Each scheduler-visible block id is a DCP-grouped virtual
+                 # block shared by all DCP ranks.
+@@ -1896,6 +1909,12 @@ def _truncate_request_for_prefill(self, request: "Request") -> None:
+             request.max_tokens = 1
+             params["_p_side_truncated"] = True
+ 
++    def on_new_request(self, request: "Request") -> None:
++        """Truncate Mamba remote-decode requests before scheduler admission."""
++        params = request.kv_transfer_params
++        if params is not None and params.get("do_remote_decode") and self.need_truncate:
++            self._truncate_request_for_prefill(request)
++
+     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+         """
+         For remote prefill, pull all prompt blocks from remote
+@@ -1923,14 +1942,14 @@ def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: in
+             # Remote prefill: get all prompt blocks from remote.
+             token_ids = request.prompt_token_ids or []
+             actual = self._state_prefill_token_count(len(token_ids))
++            remote_state_boundary_tokens = params.get("remote_state_boundary_tokens")
++            if remote_state_boundary_tokens is not None:
++                actual = min(actual, int(remote_state_boundary_tokens))
+             params["num_computed_tokens"] = num_computed_tokens
+             count = max(actual - num_computed_tokens, 0)
+             if count > 0:
+                 return count, True
+ 
+-        if params is not None and params.get("do_remote_decode") and self.need_truncate:
+-            self._truncate_request_for_prefill(request)
+-
+         # No remote prefill for this request.
+         return 0, False
+ 
+@@ -1947,7 +1966,11 @@ def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks",
+         if params is not None and params.get("do_remote_prefill"):
+             if params.get("remote_block_ids"):
+                 if all(p in params for p in ("remote_engine_id", "remote_host", "remote_port", "remote_request_id")):
+-                    local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
++                    local_block_ids = (
++                        blocks.get_unhashed_block_ids_all_groups()
++                        if num_external_tokens > 0
++                        else tuple([] for _ in self.kv_cache_groups)
++                    )
+                     local_full_block_ids = blocks.get_block_ids() if num_external_tokens > 0 else tuple()
+                     # Get unhashed blocks to pull from remote.
+                     self._reqs_need_recv[request.request_id] = (
+@@ -1969,6 +1992,11 @@ def build_connector_meta(
+     ) -> KVConnectorMetadata:
+         meta = MooncakeConnectorMetadata()
+ 
++        partial_tail_offloads = getattr(scheduler_output, "partial_tail_offloads", None)
++        if partial_tail_offloads:
++            for req_id, offloads in partial_tail_offloads.items():
++                self._partial_tail_offloads.setdefault(req_id, []).extend(offloads)
++
+         # Loop through scheduled reqs and convert to ReqMeta.
+         for req_id, (req, block_ids, full_block_ids, num_external_tokens) in self._reqs_need_recv.items():
+             assert req.kv_transfer_params is not None
+@@ -2033,13 +2061,41 @@ def request_finished(
+         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
+         computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
+         computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
++        remote_state_boundary_tokens = None
++        partial_tail_offloads = self._partial_tail_offloads.pop(request.request_id, [])
++        if partial_tail_offloads:
++            state_group_ids = {
++                group_idx
++                for group_idx, group_info in enumerate(self.group_transfer_info)
++                if group_info.is_state_group
++            }
++            boundary_tokens = {boundary for _, _, boundary in partial_tail_offloads}
++            offload_by_group = {
++                group_id: block_id
++                for group_id, block_id, _ in partial_tail_offloads
++                if group_id in state_group_ids
++            }
++            if len(boundary_tokens) == 1 and state_group_ids <= offload_by_group.keys():
++                remote_state_boundary_tokens = boundary_tokens.pop()
++                normalized_block_ids = [list(group) for group in computed_block_ids]
++                for group_id in state_group_ids:
++                    normalized_block_ids[group_id] = [offload_by_group[group_id]]
++                computed_block_ids = tuple(normalized_block_ids)
++            else:
++                logger.warning(
++                    "Ignoring incomplete Mooncake Mamba partial-tail handoff: "
++                    "request_id=%s state_group_ids=%s offloads=%s",
++                    request.request_id,
++                    state_group_ids,
++                    partial_tail_offloads,
++                )
+         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
+         delay_free_blocks = sum(computed_block_lens) > 0
+         if delay_free_blocks:
+             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
+             self._reqs_need_send[request.request_id] = time.time()
+ 
+-        return delay_free_blocks, dict(
++        transfer_params = dict(
+             do_remote_prefill=True,
+             do_remote_decode=False,
+             remote_block_ids=computed_block_ids,
+@@ -2055,6 +2111,9 @@ def request_finished(
+             num_prompt_blocks=num_prompt_blocks,
+             remote_block_size=self.block_size,
+         )
++        if remote_state_boundary_tokens is not None:
++            transfer_params["remote_state_boundary_tokens"] = remote_state_boundary_tokens
++        return delay_free_blocks, transfer_params
+ 
+     def _port_offset_from_handshake_metadata(
+         self,
+@@ -3791,6 +3850,7 @@ def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+                         remote_block_size=meta.remote_block_size,
+                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
+                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
++                        report_finished=(getattr(meta, "num_external_tokens", 1) > 0),
+                     )
+ 
+         if self.kv_send_thread is not None and self.dcp_size == 1:
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index 5c81d1fa2be3..b37c6616c481 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -295,6 +295,32 @@ def __init__(  # type: ignore[misc]
+         # ``get_kv_cache_config_from_groups`` wrapper above; configs built
+         # without the tag (e.g. unit tests) default to non-producer.
+         self.is_kv_producer = getattr(kv_cache_config, "is_kv_producer", False)
++        self.has_state_groups = any(
++            isinstance(g.kv_cache_spec, MambaSpec)
++            for g in kv_cache_config.kv_cache_groups
++        )
++        for manager in self.single_type_managers:
++            if isinstance(manager, MambaManager):
++                manager.is_kv_producer = self.is_kv_producer
++
++    def _producer_hit_cap(self, max_cache_hit_length: int) -> int:
++        """Leave a pure prefill producer at least one token to recompute.
++
++        Mooncake truncates the last prompt token before producer scheduling.
++        A local hit covering that whole truncated prompt would consequently
++        schedule zero new tokens.  On an exact fine-grained hash boundary the
++        tail checkpoint also becomes unreachable after a one-token cap, so
++        pull back one complete match unit in that case.
++        """
++        if not (self.is_kv_producer and self.has_state_groups):
++            return max_cache_hit_length
++        if (
++            self.enable_partial_hash_hits
++            and self.hash_block_size > 0
++            and max_cache_hit_length % self.hash_block_size == 0
++        ):
++            return max(max_cache_hit_length - self.hash_block_size, 0)
++        return max(max_cache_hit_length - 1, 0)
+ 
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+@@ -405,6 +431,7 @@ def find_longest_cache_hit(
+         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+             return block_hashes
+ 
++        max_cache_hit_length = self._producer_hit_cap(max_cache_hit_length)
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
+         hit_length = max_cache_hit_length
+         longest_hit_length = 0
+@@ -510,6 +537,7 @@ def find_longest_cache_hit_per_group(
+         # PD + hybrid connector path. Skip the EAGLE drop on the prefill
+         # producer (see ``self.is_kv_producer``): matched content blocks
+         # are always verified prompt blocks there.
++        max_cache_hit_length = self._producer_hit_cap(max_cache_hit_length)
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
+         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
+         hit_lengths: list[int] = [0] * num_groups
+diff --git a/vllm_ascend/patch/platform/patch_mamba_manager.py b/vllm_ascend/patch/platform/patch_mamba_manager.py
+index e0547a4c0f28..8c32e60244eb 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_manager.py
++++ b/vllm_ascend/patch/platform/patch_mamba_manager.py
+@@ -21,6 +21,51 @@ class AscendMambaManager(MambaManager):
+     def __init__(self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs) -> None:
+         super().__init__(kv_cache_spec, block_pool, **kwargs)
+         self.block_size = kv_cache_spec.block_size
++        # Set by AscendHybridKVCacheCoordinator from the effective
++        # --kv-transfer-config role.  Keep this scheduler-owned rather than
++        # relying on a process environment variable that can disagree with
++        # the connector role.
++        self.is_kv_producer = False
++
++    def add_local_computed_blocks(
++        self,
++        request_id: str,
++        new_computed_blocks: Sequence[KVCacheBlock],
++        num_local_computed_tokens: int,
++        num_external_computed_tokens: int,
++    ) -> None:
++        """Expose an exact Mamba state boundary after a producer-local hit.
++
++        Upstream records a partial-tail offload when the boundary is produced
++        by the current request.  A hot APC hit instead starts from an existing
++        partial state block; preserve that source block for the PD connector
++        before the request's CoW allocation redirects subsequent writes.
++        """
++        partial_source = None
++        if (
++            self.is_kv_producer
++            and num_local_computed_tokens > 0
++            and num_local_computed_tokens % self.block_size != 0
++            and new_computed_blocks
++        ):
++            partial_source = new_computed_blocks[-1]
++
++        super().add_local_computed_blocks(
++            request_id,
++            new_computed_blocks,
++            num_local_computed_tokens,
++            num_external_computed_tokens,
++        )
++
++        if partial_source is not None and not partial_source.is_null:
++            self._pending_partial_tail_offloads.append(
++                (
++                    request_id,
++                    self.kv_cache_group_id,
++                    partial_source,
++                    num_local_computed_tokens,
++                )
++            )
+ 
+     @classmethod
+     def find_longest_cache_hit(
+
+From b986fbf5bc0697dc9bf9dce441ad199ef0f326f3 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 20:15:33 +0800
+Subject: [PATCH 10/14] [BugFix][MRV2] Copy aligned cache views for partial CoW
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ tests/ut/worker/test_model_runner_v2_mamba.py | 27 ++++++-
+ vllm_ascend/worker/v2/model_runner.py         | 76 +++++++++++++++++++
+ 2 files changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ut/worker/test_model_runner_v2_mamba.py b/tests/ut/worker/test_model_runner_v2_mamba.py
+index 8366751e6e5a..196f783ec715 100644
+--- a/tests/ut/worker/test_model_runner_v2_mamba.py
++++ b/tests/ut/worker/test_model_runner_v2_mamba.py
+@@ -6,6 +6,7 @@
+ import numpy as np
+ import torch
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheConfig,
+@@ -22,7 +23,10 @@
+     _reshape_kv_cache_v2,
+     get_kv_cache_spec,
+ )
+-from vllm_ascend.worker.v2.model_runner import NPUModelRunner
++from vllm_ascend.worker.v2.model_runner import (
++    NPUModelRunner,
++    _copy_kv_cache_blocks_inplace_ascend,
++)
+ from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
+ from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+     AscendMambaHybridModelState,
+@@ -98,6 +102,27 @@ def test_mrv2_advertises_standardized_shared_kv_backing():
+     assert NPUModelRunner.supports_standardized_shared_kv_backing is True
+ 
+ 
++def test_mrv2_cow_copy_ignores_aligned_storage_padding():
++    # The logical view has 3 blocks, while its underlying aligned allocation
++    # has 26 elements and is deliberately not divisible by 3.
++    backing = torch.arange(26, dtype=torch.int32)
++    conv_state = backing[1:13].view(3, 4)
++    ssm_state = backing[13:25].view(3, 4)
++    padding_before = backing[[0, 25]].clone()
++    src_conv = conv_state[0].clone()
++    src_ssm = ssm_state[0].clone()
++
++    _copy_kv_cache_blocks_inplace_ascend(
++        [[conv_state, ssm_state]],
++        3,
++        [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)],
++    )
++
++    assert torch.equal(conv_state[2], src_conv)
++    assert torch.equal(ssm_state[2], src_ssm)
++    assert torch.equal(backing[[0, 25]], padding_before)
++
++
+ def test_prepare_inputs_propagates_padded_request_count():
+     model_runner_path = Path(__file__).resolve().parents[3] / "vllm_ascend" / "worker" / "v2" / "model_runner.py"
+     module = ast.parse(model_runner_path.read_text(encoding="utf-8"))
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 6d7f4f2eb954..b6efc7bb3791 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -17,6 +17,7 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ 
++from collections.abc import Iterable, Sequence
+ from contextlib import contextmanager
+ 
+ import numpy as np
+@@ -25,6 +26,7 @@
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CompilationMode, CUDAGraphMode
+ from vllm.sequence import IntermediateTensors
++from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu import model_runner as vllm_model_runner
+@@ -76,6 +78,65 @@
+ from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+ 
+ 
++def _copy_kv_cache_blocks_inplace_ascend(
++    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
++    num_blocks: int,
++    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
++) -> None:
++    """Apply CoW copies to logical Ascend cache views.
++
++    KV-transfer allocations are over-allocated and then aligned by slicing.
++    The resulting tensors therefore retain a padded underlying storage whose
++    byte size is not necessarily divisible by ``num_blocks``.  Upstream's
++    storage-wide copier sees that padding and rejects an otherwise valid CoW
++    request.  Ascend cache views are contiguous and block-major, so copy each
++    logical view instead of its padded backing storage.
++    """
++    if not kv_cache_block_copies:
++        return
++
++    first_tensor = None
++    tensors: list[torch.Tensor] = []
++    seen_views: set[tuple[int, int, tuple[int, ...], torch.dtype]] = set()
++    for entry in kv_caches:
++        entry_tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
++        for tensor in entry_tensors:
++            if not isinstance(tensor, torch.Tensor):
++                continue
++            key = (tensor.data_ptr(), tensor.numel(), tuple(tensor.stride()), tensor.dtype)
++            if key in seen_views:
++                continue
++            seen_views.add(key)
++            if tensor.numel() % num_blocks:
++                raise ValueError(
++                    "Ascend KV cache view is not divisible by the configured "
++                    f"block count: shape={tuple(tensor.shape)}, num_blocks={num_blocks}."
++                )
++            if not tensor.is_contiguous():
++                raise ValueError(
++                    "Ascend CoW requires contiguous logical KV cache views, "
++                    f"got shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}."
++                )
++            first_tensor = tensor if first_tensor is None else first_tensor
++            tensors.append(tensor)
++
++    if first_tensor is None:
++        return
++    src_indices = torch.tensor(
++        [copy.src_block_id for copy in kv_cache_block_copies],
++        dtype=torch.long,
++        device=first_tensor.device,
++    )
++    dst_indices = torch.tensor(
++        [copy.dst_block_id for copy in kv_cache_block_copies],
++        dtype=torch.long,
++        device=first_tensor.device,
++    )
++    for tensor in tensors:
++        logical_blocks = tensor.view(num_blocks, -1)
++        logical_blocks[dst_indices] = logical_blocks[src_indices]
++
++
+ class NPUModelRunner(GPUModelRunner):
+     """Model runner for Ascend NPUs."""
+ 
+@@ -86,6 +147,21 @@ class NPUModelRunner(GPUModelRunner):
+ 
+     execute_model_state: ExecuteModelState | None
+ 
++    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
++        copies = scheduler_output.kv_cache_block_copies
++        # The upstream copier operates on the complete untyped storage.  An
++        # aligned Ascend allocation keeps padding outside the logical tensor,
++        # so consume the copies here and apply them to the logical views after
++        # the parent has zeroed and updated this step's blocks.
++        scheduler_output.kv_cache_block_copies = None
++        super().update_requests(scheduler_output)
++        if copies:
++            _copy_kv_cache_blocks_inplace_ascend(
++                self.kv_caches,
++                self.kv_cache_config.num_blocks,
++                copies,
++            )
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         # Ascend-specific configurations
+         self.ascend_config = get_ascend_config()
+
+From c60eb20aa87d1b4e8aeae552eb4bd2ad2d5824f4 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Mon, 14 Sep 2026 20:23:19 +0800
+Subject: [PATCH 11/14] [CI] Format fine-grained prefix cache changes
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../distributed/kv_transfer/kv_p2p/mooncake_connector.py  | 8 ++------
+ vllm_ascend/patch/platform/patch_kv_cache_coordinator.py  | 5 +----
+ 2 files changed, 3 insertions(+), 10 deletions(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 52d19e8ebdf6..52fec27946ae 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -2065,15 +2065,11 @@ def request_finished(
+         partial_tail_offloads = self._partial_tail_offloads.pop(request.request_id, [])
+         if partial_tail_offloads:
+             state_group_ids = {
+-                group_idx
+-                for group_idx, group_info in enumerate(self.group_transfer_info)
+-                if group_info.is_state_group
++                group_idx for group_idx, group_info in enumerate(self.group_transfer_info) if group_info.is_state_group
+             }
+             boundary_tokens = {boundary for _, _, boundary in partial_tail_offloads}
+             offload_by_group = {
+-                group_id: block_id
+-                for group_id, block_id, _ in partial_tail_offloads
+-                if group_id in state_group_ids
++                group_id: block_id for group_id, block_id, _ in partial_tail_offloads if group_id in state_group_ids
+             }
+             if len(boundary_tokens) == 1 and state_group_ids <= offload_by_group.keys():
+                 remote_state_boundary_tokens = boundary_tokens.pop()
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index b37c6616c481..cfe86c8cc1de 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -295,10 +295,7 @@ def __init__(  # type: ignore[misc]
+         # ``get_kv_cache_config_from_groups`` wrapper above; configs built
+         # without the tag (e.g. unit tests) default to non-producer.
+         self.is_kv_producer = getattr(kv_cache_config, "is_kv_producer", False)
+-        self.has_state_groups = any(
+-            isinstance(g.kv_cache_spec, MambaSpec)
+-            for g in kv_cache_config.kv_cache_groups
+-        )
++        self.has_state_groups = any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups)
+         for manager in self.single_type_managers:
+             if isinstance(manager, MambaManager):
+                 manager.is_kv_producer = self.is_kv_producer
+
+From 83dd61549dbd505f04ac3b70ecc80320f767150b Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Tue, 15 Sep 2026 10:50:04 +0800
+Subject: [PATCH 12/14] [BugFix][Mamba] Stabilize APC MTP recurrent state
+ updates
+
+---
+ tests/ut/ops/test_gdn_mixed_batch.py          | 93 +++++++++++++++++++
+ tests/ut/worker/test_model_runner_v2_mamba.py | 18 ++++
+ vllm_ascend/ops/gdn.py                        | 59 ++++++++----
+ .../patch/platform/patch_mamba_manager.py     |  6 ++
+ vllm_ascend/worker/v2/model_runner.py         | 12 ++-
+ 5 files changed, 169 insertions(+), 19 deletions(-)
+
+diff --git a/tests/ut/ops/test_gdn_mixed_batch.py b/tests/ut/ops/test_gdn_mixed_batch.py
+index c98397445e01..9044ab5801b0 100644
+--- a/tests/ut/ops/test_gdn_mixed_batch.py
++++ b/tests/ut/ops/test_gdn_mixed_batch.py
+@@ -13,6 +13,8 @@
+     GDNCausalConv1dMetadata,
+     GDNDecodeMetadata,
+     GDNPrefillMetadata,
++    GDNSpecCausalConv1dMetadata,
++    GDNSpecDecodeMetadata,
+ )
+ 
+ 
+@@ -248,3 +250,94 @@ def chunk_gated_delta_rule(**kwargs):
+             ]
+         ),
+     )
++
++
++def test_spec_decode_uses_triton_recurrence_with_prefix_caching() -> None:
++    layer = _make_layer()
++    metadata = GDNAttentionMetadata(
++        num_prefills=0,
++        num_prefill_tokens=0,
++        num_decodes=0,
++        num_decode_tokens=0,
++        num_spec_decodes=1,
++        num_spec_decode_tokens=2,
++        num_actual_tokens=2,
++        spec_sequence_masks=torch.tensor([True]),
++        spec_state_indices_tensor=torch.tensor([0], dtype=torch.int32),
++    )
++    metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
++        spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
++            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
++            cache_indices=torch.tensor([0], dtype=torch.int32),
++            num_accepted_tokens=torch.tensor([2], dtype=torch.int32),
++        ),
++        actual_seq_lengths=torch.tensor([0, 2], dtype=torch.int32),
++    )
++
++    mixed_qkv = torch.tensor(
++        [
++            [1.0, 2.0, 11.0, 12.0, 21.0, 22.0],
++            [3.0, 4.0, 13.0, 14.0, 23.0, 24.0],
++        ]
++    )
++    a = torch.zeros(2, 1)
++    b = torch.zeros(2, 1)
++    core_attn_out = torch.empty(2, 1, 2)
++    forward_context = ForwardContext(
++        no_compile_layers={layer.prefix: layer},
++        attn_metadata={layer.prefix: metadata},
++        slot_mapping={},
++    )
++
++    def causal_conv1d(
++        output: torch.Tensor,
++        input_tensor: torch.Tensor,
++        conv_weights: torch.Tensor,
++        **kwargs,
++    ) -> None:
++        del conv_weights, kwargs
++        output.copy_(input_tensor)
++
++    def triton_recurrence(**kwargs):
++        return kwargs["v"].clone(), kwargs["initial_state"]
++
++    with (
++        override_forward_context(forward_context),
++        patch(
++            "vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating",
++            return_value=(torch.zeros(1, 2, 1), torch.ones(1, 2, 1)),
++        ),
++        patch("vllm_ascend.ops.gdn.fused_recurrent_gated_delta_rule", side_effect=triton_recurrence) as triton_mock,
++        patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
++        patch.object(
++            torch.ops._C_ascend,
++            "npu_causal_conv1d_custom",
++            side_effect=causal_conv1d,
++            create=True,
++        ),
++        patch.object(
++            torch.ops._C_ascend,
++            "npu_recurrent_gated_delta_rule",
++            side_effect=AssertionError("APC speculative decode must not use the AscendC recurrence"),
++            create=True,
++        ),
++    ):
++        AscendGatedDeltaNetAttention._forward_core(
++            layer,
++            mixed_qkv,
++            b,
++            a,
++            core_attn_out,
++        )
++
++    assert triton_mock.call_count == 1
++    call = triton_mock.call_args.kwargs
++    assert call["initial_state"] is layer.kv_cache[1]
++    assert call["inplace_final_state"] is True
++    torch.testing.assert_close(call["cu_seqlens"], torch.tensor([0, 2], dtype=torch.int32))
++    torch.testing.assert_close(call["ssm_state_indices"], torch.tensor([0], dtype=torch.int32))
++    torch.testing.assert_close(call["num_accepted_tokens"], torch.tensor([2], dtype=torch.int32))
++    torch.testing.assert_close(
++        core_attn_out,
++        torch.tensor([[[21.0, 22.0]], [[23.0, 24.0]]]),
++    )
+diff --git a/tests/ut/worker/test_model_runner_v2_mamba.py b/tests/ut/worker/test_model_runner_v2_mamba.py
+index 196f783ec715..2e232fc90ea0 100644
+--- a/tests/ut/worker/test_model_runner_v2_mamba.py
++++ b/tests/ut/worker/test_model_runner_v2_mamba.py
+@@ -123,6 +123,24 @@ def test_mrv2_cow_copy_ignores_aligned_storage_padding():
+     assert torch.equal(backing[[0, 25]], padding_before)
+ 
+ 
++def test_mrv2_cow_copy_snapshots_overlapping_views_before_writes():
++    # Hybrid Attention/Mamba views can overlap one shared allocation.  The
++    # destination of the first view aliases the source of the second view, so
++    # sequential read/write copies would propagate the wrong bytes.
++    backing = torch.arange(12, dtype=torch.int32)
++    first_view = backing[:8].view(4, 2)
++    second_view = backing[4:].view(4, 2)
++    expected_second_source = second_view[0].clone()
++
++    _copy_kv_cache_blocks_inplace_ascend(
++        [[first_view], [second_view]],
++        4,
++        [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)],
++    )
++
++    assert torch.equal(second_view[2], expected_second_source)
++
++
+ def test_prepare_inputs_propagates_padded_request_count():
+     model_runner_path = Path(__file__).resolve().parents[3] / "vllm_ascend" / "worker" / "v2" / "model_runner.py"
+     module = ast.parse(model_runner_path.read_text(encoding="utf-8"))
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index fc9b52fa2385..9e6c94a5d917 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -22,6 +22,9 @@
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
++from vllm.third_party.flash_linear_attention.ops import (
++    fused_recurrent_gated_delta_rule,
++)
+ from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+ from vllm.triton_utils import triton
+ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # type: ignore
+@@ -460,24 +463,44 @@ def _forward_core(
+         # 2.1: Process the multi-query part
+         if spec_sequence_masks is not None:
+             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+-            query_spec = l2norm_fwd(query_spec)
+-            key_spec = l2norm_fwd(key_spec)
+-            # Dispatches to the vllm-ascend AscendC custom operator
+-            # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
+-            # The custom op extends dtype support (e.g. float32 state) and is
+-            # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
+-            core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+-                query=query_spec.squeeze(0),
+-                key=key_spec.squeeze(0),
+-                value=value_spec.squeeze(0),
+-                g=g_spec.squeeze(0),
+-                beta=beta_spec.squeeze(0),
+-                state=ssm_state,
+-                scale=key_spec.shape[-1] ** -0.5,
+-                actual_seq_lengths=actual_seq_lengths,
+-                ssm_state_indices=spec_state_indices_tensor.flatten(),
+-                num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+-            ).unsqueeze(0)
++            if self.cache_config.enable_prefix_caching:
++                # APC prefill and partial-hit resume use the Triton chunk GDN
++                # implementation below. Keep speculative recurrent updates in
++                # the same implementation family: mixing a Triton-produced
++                # cached state with the AscendC recurrence can amplify BF16
++                # accumulation drift until generation becomes unstable.
++                core_attn_out_spec, _ = fused_recurrent_gated_delta_rule(
++                    q=query_spec,
++                    k=key_spec,
++                    v=value_spec,
++                    g=g_spec,
++                    beta=beta_spec,
++                    initial_state=ssm_state,
++                    inplace_final_state=True,
++                    cu_seqlens=spec_causal_conv1d_meta.query_start_loc,
++                    ssm_state_indices=spec_state_indices_tensor,
++                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
++                    use_qk_l2norm_in_kernel=True,
++                )
++            else:
++                query_spec = l2norm_fwd(query_spec)
++                key_spec = l2norm_fwd(key_spec)
++                # Dispatches to the vllm-ascend AscendC custom operator
++                # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN
++                # operator. The custom op extends dtype support (e.g. float32
++                # state) and is loaded via ASCEND_CUSTOM_OPP_PATH.
++                core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
++                    query=query_spec.squeeze(0),
++                    key=key_spec.squeeze(0),
++                    value=value_spec.squeeze(0),
++                    g=g_spec.squeeze(0),
++                    beta=beta_spec.squeeze(0),
++                    state=ssm_state,
++                    scale=key_spec.shape[-1] ** -0.5,
++                    actual_seq_lengths=actual_seq_lengths,
++                    ssm_state_indices=spec_state_indices_tensor.flatten(),
++                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
++                ).unsqueeze(0)
+         else:
+             core_attn_out_spec, last_recurrent_state = None, None
+ 
+diff --git a/vllm_ascend/patch/platform/patch_mamba_manager.py b/vllm_ascend/patch/platform/patch_mamba_manager.py
+index 8c32e60244eb..6f48e8977809 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_manager.py
++++ b/vllm_ascend/patch/platform/patch_mamba_manager.py
+@@ -4,6 +4,7 @@
+ # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+ # This file is a part of the vllm-ascend project.
+ #
++import os
+ from collections.abc import Sequence
+ 
+ import vllm.v1.core.single_type_kv_cache_manager as single_type_kv_cache_manager
+@@ -27,6 +28,11 @@ def __init__(self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs) ->
+         # the connector role.
+         self.is_kv_producer = False
+ 
++    def _cache_partial_tail_block(self, *args, **kwargs):
++        if os.getenv("VLLM_ASCEND_DIAG_DISABLE_MAMBA_PARTIAL_TAIL") == "1":
++            return None
++        return super()._cache_partial_tail_block(*args, **kwargs)
++
+     def add_local_computed_blocks(
+         self,
+         request_id: str,
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index b6efc7bb3791..c78e738439bd 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -17,6 +17,7 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ 
++import os
+ from collections.abc import Iterable, Sequence
+ from contextlib import contextmanager
+ 
+@@ -94,6 +95,8 @@ def _copy_kv_cache_blocks_inplace_ascend(
+     """
+     if not kv_cache_block_copies:
+         return
++    if os.getenv("VLLM_ASCEND_DIAG_DISABLE_KV_COW_COPY") == "1":
++        return
+ 
+     first_tensor = None
+     tensors: list[torch.Tensor] = []
+@@ -132,9 +135,16 @@ def _copy_kv_cache_blocks_inplace_ascend(
+         dtype=torch.long,
+         device=first_tensor.device,
+     )
++    # Different logical cache views can overlap the same hybrid backing
++    # allocation. Snapshot every source before writing any destination;
++    # otherwise an earlier view's destination may alias a later view's source
++    # and make the CoW result depend on view iteration order.
++    pending_writes: list[tuple[torch.Tensor, torch.Tensor]] = []
+     for tensor in tensors:
+         logical_blocks = tensor.view(num_blocks, -1)
+-        logical_blocks[dst_indices] = logical_blocks[src_indices]
++        pending_writes.append((logical_blocks, logical_blocks[src_indices].clone()))
++    for logical_blocks, source_snapshot in pending_writes:
++        logical_blocks[dst_indices] = source_snapshot
+ 
+ 
+ class NPUModelRunner(GPUModelRunner):
+
+From 23c65ef6a8c5498df69c80757d87746c6311d7d2 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Tue, 15 Sep 2026 18:18:41 +0800
+Subject: [PATCH 13/14] [BugFix][Mamba] Keep MTP prompt tails on prefill path
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ tests/ut/ops/test_gdn_attn_builder.py | 35 +++++++++++++++++++++++++++
+ vllm_ascend/ops/gdn_attn_builder.py   |  9 +++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/tests/ut/ops/test_gdn_attn_builder.py b/tests/ut/ops/test_gdn_attn_builder.py
+index c34cde4de60b..32cc95746f80 100644
+--- a/tests/ut/ops/test_gdn_attn_builder.py
++++ b/tests/ut/ops/test_gdn_attn_builder.py
+@@ -192,6 +192,41 @@ def _make_builder(
+     return AscendGDNAttentionMetadataBuilder(spec, ["layer0"], vllm_config, device)
+ 
+ 
++@pytest.mark.parametrize(
++    ("method", "expected_mask", "expected_accepted"),
++    [
++        pytest.param("mtp", False, 1, id="qwen-mtp-keeps-short-tail-prefill"),
++        pytest.param("dspark", True, 2, id="dspark-folds-short-tail"),
++    ],
++)
++def test_spec_sized_stateful_prefill_fold_is_method_specific(
++    method: str,
++    expected_mask: bool,
++    expected_accepted: int,
++):
++    common_attn_metadata = create_common_attn_metadata(
++        BatchSpec(seq_lens=[18], query_lens=[2]),
++        block_size=16,
++        device=torch.device("cpu"),
++    )
++    builder = _make_builder(
++        device=torch.device("cpu"),
++        num_heads=32,
++        num_speculative_tokens=1,
++    )
++    builder.vllm_config.speculative_config.method = method
++
++    masks, accepted = builder._fold_spec_sized_prefill_chunks_into_spec(
++        common_attn_metadata,
++        torch.tensor([False]),
++        torch.tensor([1], dtype=torch.int32),
++    )
++
++    assert masks.tolist() == [expected_mask]
++    assert accepted is not None
++    assert accepted.tolist() == [expected_accepted]
++
++
+ def _build_attn_metadata(
+     batch_spec: BatchSpec,
+     *,
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index 077e4ab95eb1..3a967d88c97e 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -480,6 +480,15 @@ def _fold_spec_sized_prefill_chunks_into_spec(
+         num_accepted_tokens: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+         """Advance stateful spec-width prompt chunks through live spec inputs."""
++        # This fold is required by the Kimi DSpark/DFlash state handoff. Qwen
++        # MTP must keep a short stateful prompt tail on the
++        # prefill path: treating it as accepted draft tokens advances recurrent
++        # state with speculative-decode semantics and corrupts Qwen GDN output.
++        speculative_config = self.vllm_config.speculative_config
++        method = getattr(speculative_config, "method", None)
++        if method == "mtp":
++            return spec_sequence_masks_cpu, num_accepted_tokens
++
+         is_prefilling = common_attn_metadata.is_prefilling
+         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+         if is_prefilling is None or seq_lens_cpu is None or num_accepted_tokens is None:
+
+From d74264b7f8a4832c8a6c439d40256fe81c900ca6 Mon Sep 17 00:00:00 2001
+From: likailong <likailong5@huawei.com>
+Date: Tue, 15 Sep 2026 21:29:53 +0800
+Subject: [PATCH 14/14] fix: migrate partial-hit runtime fixes to Ascend
+
+Signed-off-by: likailong <likailong5@huawei.com>
+---
+ .../test_patch_mamba_block_aligned_split.py   |  19 ++
+ .../platform/test_patch_mamba_manager.py      |  58 ++++-
+ .../platform/test_patch_thinking_budget.py    |  25 ++
+ vllm_ascend/patch/platform/__init__.py        |   1 +
+ .../patch_mamba_block_aligned_split.py        |  51 +++-
+ .../patch/platform/patch_mamba_manager.py     |  45 ++++
+ .../patch/platform/patch_thinking_budget.py   | 236 ++++++++++++++++++
+ 7 files changed, 433 insertions(+), 2 deletions(-)
+ create mode 100644 tests/ut/patch/platform/test_patch_thinking_budget.py
+ create mode 100644 vllm_ascend/patch/platform/patch_thinking_budget.py
+
+diff --git a/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py b/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
+index cc43ebf8d50d..4918ad7c36fe 100644
+--- a/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
++++ b/tests/ut/patch/platform/test_patch_mamba_block_aligned_split.py
+@@ -102,6 +102,25 @@ def test_non_pd_request_retains_upstream_mamba_boundary_split():
+     assert result == 5
+ 
+ 
++def test_partial_hit_does_not_stop_at_shared_prefix_junction():
++    request = _request(
++        num_computed_tokens=0,
++        num_prompt_tokens=2000,
++        num_tokens=2000,
++    )
++    request.shared_prefix_boundary = 600
++
++    result = _mamba_block_aligned_split(
++        _scheduler(is_kv_consumer=False),
++        request,
++        num_new_tokens=1000,
++    )
++
++    # Normal alignment ends at 768. The upstream junction stop would cut this
++    # chunk at 384 and create a cold-path-absent recurrent-kernel boundary.
++    assert result == 768
++
++
+ def test_pd_consumer_preserves_window_after_external_cache_hit():
+     result = _mamba_block_aligned_split(
+         _scheduler(is_kv_consumer=True),
+diff --git a/tests/ut/patch/platform/test_patch_mamba_manager.py b/tests/ut/patch/platform/test_patch_mamba_manager.py
+index 6a224e09acf2..25ce8aad4f55 100644
+--- a/tests/ut/patch/platform/test_patch_mamba_manager.py
++++ b/tests/ut/patch/platform/test_patch_mamba_manager.py
+@@ -1,7 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ from types import SimpleNamespace
+ 
+-from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
++from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
++from vllm_ascend.patch.platform.patch_mamba_manager import (
++    AscendMambaManager,
++    _allocate_new_blocks_after_growing_request,
++)
+ 
+ # Importing vLLM activates the Ascend platform plugin, which replaces the
+ # module-level ``MambaManager`` symbol with ``AscendMambaManager``.  Patch the
+@@ -46,3 +50,55 @@ def test_consumer_partial_hit_does_not_create_producer_handoff(monkeypatch):
+     manager.add_local_computed_blocks("req", [source], 144, 0)
+ 
+     assert manager._pending_partial_tail_offloads == []
++
++
++class _BlockPool:
++    def __init__(self, batches):
++        self.batches = list(batches)
++
++    def get_new_blocks(self, count):
++        blocks = self.batches.pop(0)
++        assert len(blocks) == count
++        return blocks
++
++
++def _allocation_manager(source, grown_block):
++    manager = AscendMambaManager.__new__(AscendMambaManager)
++    manager.block_size = 16
++    manager.req_to_blocks = {"req": [SimpleNamespace(block_id=1)]}
++    manager._partial_hit_reqs = {"req": (1, source)}
++    manager._record_new_block_ids = True
++    manager.new_block_ids = []
++    cow = SimpleNamespace(block_id=3, is_null=False)
++    manager.block_pool = _BlockPool([[grown_block], [cow]])
++    manager._apply_cow = lambda request_id, idx, old, new: manager.req_to_blocks[
++        request_id
++    ].__setitem__(idx, new)
++    return manager, cow
++
++
++def test_partial_hit_cow_runs_after_block_table_growth():
++    assert (
++        SingleTypeKVCacheManager.allocate_new_blocks
++        is _allocate_new_blocks_after_growing_request
++    )
++    source = SimpleNamespace(block_id=2, is_null=False)
++    manager, cow = _allocation_manager(source, source)
++
++    allocated = _allocate_new_blocks_after_growing_request(manager, "req", 32, 32)
++
++    assert allocated == [cow, source]
++    assert manager.req_to_blocks["req"][1] is cow
++    assert manager.new_block_ids == [source.block_id, cow.block_id]
++
++
++def test_stale_partial_hit_registration_skips_cow():
++    source = SimpleNamespace(block_id=2, is_null=False)
++    replacement = SimpleNamespace(block_id=4, is_null=False)
++    manager, _ = _allocation_manager(source, replacement)
++
++    allocated = _allocate_new_blocks_after_growing_request(manager, "req", 32, 32)
++
++    assert allocated == [replacement]
++    assert manager.req_to_blocks["req"][1] is replacement
++    assert manager.new_block_ids == [replacement.block_id]
+diff --git a/tests/ut/patch/platform/test_patch_thinking_budget.py b/tests/ut/patch/platform/test_patch_thinking_budget.py
+new file mode 100644
+index 000000000000..1265da878d90
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_thinking_budget.py
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import inspect
++
++import vllm.v1.worker.gpu.sample.thinking_budget as thinking_budget
++
++from vllm_ascend.patch.platform.patch_thinking_budget import (
++    _thinking_budget_kernel,
++    _update_committed_marker_cache_kernel,
++)
++
++
++def test_ascend_thinking_budget_kernels_are_registered():
++    assert thinking_budget._thinking_budget_kernel is _thinking_budget_kernel
++    assert (
++        thinking_budget._update_committed_marker_cache_kernel
++        is _update_committed_marker_cache_kernel
++    )
++
++
++def test_local_marker_scan_uses_static_slots():
++    source = inspect.getsource(_thinking_budget_kernel.fn)
++    assert "tl.static_range(0, 4)" in source
++    assert "tl.range(start_lo" not in source
++    assert "tl.range(end_lo" not in source
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index c6dc818a4700..2a855547e71a 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -20,6 +20,7 @@
+ import vllm_ascend.patch.platform.patch_distributed  # noqa
+ import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+ import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
++import vllm_ascend.patch.platform.patch_thinking_budget  # noqa
+ import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
+ import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
+ import vllm_ascend.patch.platform.patch_use_v2_model_runner  # noqa
+diff --git a/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py b/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
+index 9e8eebea080c..90cfea480062 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
++++ b/vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py
+@@ -47,6 +47,55 @@
+ _original_mamba_block_aligned_split = Scheduler._mamba_block_aligned_split
+ 
+ 
++def _split_without_shared_prefix_junction(
++    self: Scheduler,
++    request: Request,
++    num_new_tokens: int,
++    num_new_local_computed_tokens: int,
++    num_external_computed_tokens: int,
++) -> int:
++    """Apply upstream Mamba alignment without a shared-prefix chunk stop."""
++    start = (
++        request.num_computed_tokens
++        + num_new_local_computed_tokens
++        + num_external_computed_tokens
++    )
++    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
++    if start >= prefill_end:
++        return num_new_tokens
++
++    block_size = self.cache_config.block_size
++    last_cache_position = request.num_tokens - request.num_tokens % block_size
++    if self.use_eagle:
++        last_cache_position = max(last_cache_position - block_size, 0)
++
++    end = start + num_new_tokens
++    if end < prefill_end:
++        max_prefill_tokens = self.max_num_scheduled_tokens
++        long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
++        if long_prefill_threshold > 0:
++            max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
++        aligned_end = end // block_size * block_size
++        if aligned_end > start or block_size <= max_prefill_tokens:
++            end = aligned_end
++
++    next_block_boundary = (start // block_size + 1) * block_size
++    tail_boundary = (
++        request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
++        if self.mamba_partial_cache_hit
++        else 0
++    )
++    stops = (
++        next_block_boundary if start % block_size != 0 else 0,
++        last_cache_position,
++        tail_boundary
++        if last_cache_position < tail_boundary < request.num_prompt_tokens
++        else 0,
++    )
++    end = min((stop for stop in stops if start < stop < end), default=end)
++    return max(end - start, 0)
++
++
+ @functools.wraps(_original_mamba_block_aligned_split)
+ def _mamba_block_aligned_split(
+     self: Scheduler,
+@@ -85,7 +134,7 @@ def _mamba_block_aligned_split(
+                 num_new_tokens = last_cache_position - num_computed_tokens
+         return num_new_tokens
+ 
+-    return _original_mamba_block_aligned_split(
++    return _split_without_shared_prefix_junction(
+         self,
+         request,
+         num_new_tokens,
+diff --git a/vllm_ascend/patch/platform/patch_mamba_manager.py b/vllm_ascend/patch/platform/patch_mamba_manager.py
+index 6f48e8977809..be6b10cc65e5 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_manager.py
++++ b/vllm_ascend/patch/platform/patch_mamba_manager.py
+@@ -15,7 +15,49 @@
+     KVCacheSpec,
+     MambaManager,
+     MambaSpec,
++    SingleTypeKVCacheManager,
+ )
++from vllm.utils.math_utils import cdiv
++
++
++def _allocate_new_blocks_after_growing_request(
++    self: SingleTypeKVCacheManager,
++    request_id: str,
++    num_tokens: int,
++    num_tokens_main_model: int,
++) -> list[KVCacheBlock]:
++    """Grow the request block table before resolving partial-hit CoW.
++
++    Partial-prefix registrations are owned by the common single-type manager,
++    not only by Mamba managers.  Patch the base implementation so attention
++    and recurrent cache groups observe the same safe allocation order.
++    """
++    partial_hit_info = self._partial_hit_reqs.pop(request_id, None)
++
++    req_blocks = self.req_to_blocks[request_id]
++    num_required_blocks = cdiv(num_tokens, self.block_size)
++    num_new_blocks = num_required_blocks - len(req_blocks)
++    new_blocks: list[KVCacheBlock] = []
++    if num_new_blocks > 0:
++        new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
++        req_blocks.extend(new_blocks)
++        if self._record_new_block_ids:
++            self.new_block_ids.extend(block.block_id for block in new_blocks)
++
++    cow_blocks: list[KVCacheBlock] = []
++    if partial_hit_info is not None:
++        block_idx, source_block = partial_hit_info
++        if (
++            block_idx < len(req_blocks)
++            and req_blocks[block_idx] is source_block
++            and not source_block.is_null
++        ):
++            cow_block = self.block_pool.get_new_blocks(1)[0]
++            self._apply_cow(request_id, block_idx, source_block, cow_block)
++            self.new_block_ids.append(cow_block.block_id)
++            cow_blocks.append(cow_block)
++
++    return cow_blocks + new_blocks
+ 
+ 
+ class AscendMambaManager(MambaManager):
+@@ -139,4 +181,7 @@ def get_num_blocks_to_allocate(
+         return num_new_blocks
+ 
+ 
++SingleTypeKVCacheManager.allocate_new_blocks = (
++    _allocate_new_blocks_after_growing_request
++)
+ single_type_kv_cache_manager.MambaManager = AscendMambaManager
+diff --git a/vllm_ascend/patch/platform/patch_thinking_budget.py b/vllm_ascend/patch/platform/patch_thinking_budget.py
+new file mode 100644
+index 000000000000..4ce7af0ad575
+--- /dev/null
++++ b/vllm_ascend/patch/platform/patch_thinking_budget.py
+@@ -0,0 +1,236 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++"""Ascend-compatible Triton kernels for Model Runner V2 thinking budgets."""
++
++import vllm.v1.worker.gpu.sample.thinking_budget as thinking_budget
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _update_committed_marker_cache_kernel(
++    req_ids_ptr,
++    thinking_token_budget_ptr,
++    all_token_ids_ptr,
++    all_token_ids_stride,
++    total_len_ptr,
++    cached_last_start_ptr,
++    cached_last_end_ptr,
++    cached_scan_pos_ptr,
++    reasoning_start_token_ids_ptr,
++    natural_reasoning_end_token_ids_ptr,
++    START_LEN: tl.constexpr,
++    NATURAL_END_LEN: tl.constexpr,
++    MAX_LEN: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    req_state_idx = tl.load(req_ids_ptr + tl.program_id(0))
++    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
++    if budget < 0:
++        return
++
++    total_len = tl.load(total_len_ptr + req_state_idx)
++    scan_pos = tl.load(cached_scan_pos_ptr + req_state_idx)
++    last_start = tl.load(cached_last_start_ptr + req_state_idx)
++    last_end = tl.load(cached_last_end_ptr + req_state_idx)
++
++    if scan_pos > total_len:
++        scan_pos = 0
++        last_start = -1
++        last_end = -1
++
++    if (scan_pos == 0) & (last_start < 0) & (last_end < 0):
++        block_hi = total_len
++        while (block_hi > 0) & (last_start < 0) & (last_end < 0):
++            block_lo = block_hi - BLOCK
++            if block_lo < 0:
++                block_lo = 0
++            offs = block_lo + tl.arange(0, BLOCK)
++
++            start_match = (offs < block_hi) & (offs + START_LEN <= total_len)
++            for j in tl.static_range(0, START_LEN):
++                expected = tl.load(reasoning_start_token_ids_ptr + j)
++                actual = tl.load(
++                    all_token_ids_ptr
++                    + req_state_idx * all_token_ids_stride
++                    + offs
++                    + j,
++                    mask=offs + j < total_len,
++                    other=-1,
++                )
++                start_match = start_match & (actual == expected)
++
++            end_match = (offs < block_hi) & (
++                offs + NATURAL_END_LEN <= total_len
++            )
++            for j in tl.static_range(0, NATURAL_END_LEN):
++                expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
++                actual = tl.load(
++                    all_token_ids_ptr
++                    + req_state_idx * all_token_ids_stride
++                    + offs
++                    + j,
++                    mask=offs + j < total_len,
++                    other=-1,
++                )
++                end_match = end_match & (actual == expected)
++
++            last_start = tl.max(tl.where(start_match, offs, -1), axis=0)
++            last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
++            block_hi = block_lo
++    else:
++        for i in tl.range(scan_pos, total_len):
++            if i + START_LEN <= total_len:
++                start_match = True
++                for j in tl.static_range(0, START_LEN):
++                    expected = tl.load(reasoning_start_token_ids_ptr + j)
++                    actual = tl.load(
++                        all_token_ids_ptr
++                        + req_state_idx * all_token_ids_stride
++                        + i
++                        + j
++                    )
++                    start_match = start_match & (actual == expected)
++                if start_match:
++                    last_start = i
++
++            if i + NATURAL_END_LEN <= total_len:
++                end_match = True
++                for j in tl.static_range(0, NATURAL_END_LEN):
++                    expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
++                    actual = tl.load(
++                        all_token_ids_ptr
++                        + req_state_idx * all_token_ids_stride
++                        + i
++                        + j
++                    )
++                    end_match = end_match & (actual == expected)
++                if end_match:
++                    last_end = i
++
++    tl.store(cached_last_start_ptr + req_state_idx, last_start)
++    tl.store(cached_last_end_ptr + req_state_idx, last_end)
++    new_scan_pos = total_len - (MAX_LEN - 1)
++    if new_scan_pos < 0:
++        new_scan_pos = 0
++    tl.store(cached_scan_pos_ptr + req_state_idx, new_scan_pos)
++
++
++@triton.jit
++def _thinking_budget_kernel(
++    logits_ptr,
++    logits_stride,
++    expanded_idx_mapping_ptr,
++    thinking_token_budget_ptr,
++    all_token_ids_ptr,
++    all_token_ids_stride,
++    total_len_ptr,
++    input_ids_ptr,
++    expanded_local_pos_ptr,
++    cached_last_start_ptr,
++    cached_last_end_ptr,
++    reasoning_start_token_ids_ptr,
++    natural_reasoning_end_token_ids_ptr,
++    reasoning_end_token_ids_ptr,
++    START_LEN: tl.constexpr,
++    NATURAL_END_LEN: tl.constexpr,
++    END_LEN: tl.constexpr,
++):
++    token_idx = tl.program_id(0).to(tl.int64)
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
++    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
++    if budget < 0:
++        return
++
++    local_pos = tl.load(expanded_local_pos_ptr + token_idx)
++    cur_req_first_pos = token_idx - local_pos
++    total_len = tl.load(total_len_ptr + req_state_idx)
++    effective_len = total_len + local_pos
++    last_start = tl.load(cached_last_start_ptr + req_state_idx)
++    last_end = tl.load(cached_last_end_ptr + req_state_idx)
++
++    start_lo = total_len - START_LEN + 1
++    if start_lo < 0:
++        start_lo = 0
++    for scan_offset in tl.static_range(0, 4):
++        i = start_lo + scan_offset
++        if i < effective_len - START_LEN + 1:
++            start_match = True
++            for j in tl.static_range(0, START_LEN):
++                expected = tl.load(reasoning_start_token_ids_ptr + j)
++                actual = thinking_budget._load_effective_token(
++                    all_token_ids_ptr,
++                    all_token_ids_stride,
++                    input_ids_ptr,
++                    cur_req_first_pos,
++                    req_state_idx,
++                    total_len,
++                    i + j,
++                )
++                start_match = start_match & (actual == expected)
++            if start_match:
++                last_start = i
++
++    end_lo = total_len - NATURAL_END_LEN + 1
++    if end_lo < 0:
++        end_lo = 0
++    for scan_offset in tl.static_range(0, 4):
++        i = end_lo + scan_offset
++        if i < effective_len - NATURAL_END_LEN + 1:
++            end_match = True
++            for j in tl.static_range(0, NATURAL_END_LEN):
++                expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
++                actual = thinking_budget._load_effective_token(
++                    all_token_ids_ptr,
++                    all_token_ids_stride,
++                    input_ids_ptr,
++                    cur_req_first_pos,
++                    req_state_idx,
++                    total_len,
++                    i + j,
++                )
++                end_match = end_match & (actual == expected)
++            if end_match:
++                last_end = i
++
++    if last_start < 0 or last_start <= last_end:
++        return
++
++    reasoning_start = last_start + START_LEN
++    num_reasoning_tokens = effective_len - reasoning_start
++    if num_reasoning_tokens < budget:
++        return
++
++    end_prefix_len = 0
++    max_prefix_len = END_LEN - 1
++    if effective_len < max_prefix_len:
++        max_prefix_len = effective_len
++
++    for prefix_len in tl.static_range(1, END_LEN):
++        if prefix_len <= max_prefix_len:
++            prefix_match = True
++            suffix_start = effective_len - prefix_len
++            for j in tl.static_range(0, END_LEN):
++                if j < prefix_len:
++                    expected = tl.load(reasoning_end_token_ids_ptr + j)
++                    actual = thinking_budget._load_effective_token(
++                        all_token_ids_ptr,
++                        all_token_ids_stride,
++                        input_ids_ptr,
++                        cur_req_first_pos,
++                        req_state_idx,
++                        total_len,
++                        suffix_start + j,
++                    )
++                    prefix_match = prefix_match & (actual == expected)
++            if prefix_match:
++                end_prefix_len = prefix_len
++
++    force_token_id = tl.load(reasoning_end_token_ids_ptr + end_prefix_len)
++    tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
++
++
++thinking_budget._update_committed_marker_cache_kernel = (
++    _update_committed_marker_cache_kernel
++)
++thinking_budget._thinking_budget_kernel = _thinking_budget_kernel
