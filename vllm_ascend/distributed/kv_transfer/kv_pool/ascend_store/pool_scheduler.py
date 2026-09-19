@@ -70,6 +70,12 @@ class KVPoolScheduler:
         self.vllm_config = vllm_config
         self.use_layerwise = use_layerwise
         self.kv_cache_config = kv_cache_config
+        # Set by ``AscendStoreConnector.set_eagle_prefix_cache_hashing`` from
+        # the connector capability negotiation. When on, the engine uses
+        # successor-aware EAGLE prefix-cache hashing and the legacy EAGLE
+        # last-block drop is gone, so the pool must publish every block hash
+        # the engine finalized (see ``_publishable_hashes``).
+        self.use_eagle_prefix_cache_hashing = False
         hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
         hf_config = getattr(vllm_config.model_config, "hf_config", hf_text_config)
         self.hf_config = hf_text_config or hf_config

@@ -145,6 +145,24 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
+    @property
+    def supports_eagle_prefix_cache_hashing(self) -> bool:
+        """Opt into the successor-aware EAGLE prefix-cache hashing protocol.
+
+        The KV pool is content-addressed by block hash, and every PD role in a
+        deployment runs this same connector, so producer and consumer always
+        agree on the hashing scheme. Opting in lets the engine drop the legacy
+        EAGLE "last-block drop"; on hybrid Mamba models with ``align`` pages
+        that drop backs the prefill producer off one Mamba page, which leaves
+        the page unhashed and pins P-side prefix-cache hits to 0.
+        """
+        return True
+
+    def set_eagle_prefix_cache_hashing(self, enabled: bool) -> None:
+        super().set_eagle_prefix_cache_hashing(enabled)
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.use_eagle_prefix_cache_hashing = enabled
+
     ############################################################
     # Scheduler Side Methods
     ############################################################

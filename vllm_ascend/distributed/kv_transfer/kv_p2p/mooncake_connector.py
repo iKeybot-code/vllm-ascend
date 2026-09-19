@@ -1610,6 +1610,19 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return True
 
+    @property
+    def supports_eagle_prefix_cache_hashing(self) -> bool:
+        """Opt into the successor-aware EAGLE prefix-cache hashing protocol.
+
+        This connector moves KV by explicit block id rather than by content
+        hash, so it has nothing to publish itself. The flag is declared
+        anyway because it is combined with the content-addressed pool
+        connector through ``AscendMultiConnector`` (``all(children)``), and
+        every PD role in a deployment runs the same connector set, so the
+        engines sharing the pool always agree on the hashing scheme.
+        """
+        return True
+
     def __init__(  # type: ignore[misc]
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None
     ):
